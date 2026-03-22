@@ -1,3 +1,12 @@
 src/code/__pycache__/data_load.cpython-312.pyc
 src/code/__pycache__/data_preparation.cpython-312.pyc
 src/code/__pycache__/io_utils.cpython-312.pyc
+data/prepared/macro_data_clean.parquet
+data/prepared/training_bu.parquet
+data/prepared/training_segment.parquet
+data/prepared/training_subsegment.parquet
+data/prepared/training_total.parquet
+data/prepared/validation_bu.parquet
+data/prepared/validation_segment.parquet
+data/prepared/validation_subsegment.parquet
+data/prepared/validation_total.parquet

@@ -19,3 +19,7 @@ def load_bus():         return load_all_data()["BUs"]
 def load_validation():  return load_all_data()["validation"]
 def load_macro_data():  return load_all_data()["macro_data"]
 def load_period_data(): return load_all_data()["period_data"]
+
+def load_bus_parsed():
+    from src.code.data_preparation import parse_bus
+    return parse_bus(load_bus())
