@@ -337,6 +337,58 @@ def merge_with_macro(df: pd.DataFrame, macro_data: pd.DataFrame) -> pd.DataFrame
         .drop(columns=["Period"])
     )
 
+def detect_outliers(
+    df: pd.DataFrame,
+    dataset_name: str = "Dataset",
+    iqr_threshold: float = 1.5,
+    zscore_threshold: float = 3.0,
+) -> pd.DataFrame:
+    """
+    Step 4 - Detect outliers in numeric columns (no data is modified).
+
+    Args:
+        df               : Input DataFrame.
+        dataset_name     : Name to display in the summary.
+        iqr_threshold    : IQR multiplier to define outlier bounds (default: 1.5).
+        zscore_threshold : Z-score threshold to flag outliers (default: 3.0).
+
+    Returns:
+        None — outliers are only reported, no data is modified.
+    """
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    col_width = max(len(c) for c in numeric_cols + ["Column"])
+
+    print(f"[{dataset_name}] Outlier Detection")
+    print(f"  {'Column':<{col_width}} {'IQR outliers':>14} {'Z-score outliers':>17} {'% rows':>8}")
+    print(f"  {'-'*col_width} {'-'*14} {'-'*17} {'-'*8}")
+
+    total_iqr = 0
+    total_z = 0
+
+    for col in numeric_cols:
+        series = df[col].dropna()
+
+        # IQR
+        q1, q3 = series.quantile(0.25), series.quantile(0.75)
+        iqr = q3 - q1
+        iqr_mask = (df[col] < q1 - iqr_threshold * iqr) | (df[col] > q3 + iqr_threshold * iqr)
+        iqr_count = iqr_mask.sum()
+
+        # Z-score
+        z_scores = (df[col] - series.mean()) / series.std()
+        z_mask = z_scores.abs() > zscore_threshold
+        z_count = z_mask.sum()
+
+        pct = round(max(iqr_count, z_count) / len(df) * 100, 1)
+        total_iqr += iqr_count
+        total_z += z_count
+
+        print(f"  {col:<{col_width}} {iqr_count:>14} {z_count:>17} {pct:>7}%")
+
+    print(f"  {'-'*col_width} {'-'*14} {'-'*17} {'-'*8}")
+    print(f"  {'TOTAL':<{col_width}} {total_iqr:>14} {total_z:>17}")
+    print()
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HIERARCHICAL AGGREGATION
 # ─────────────────────────────────────────────────────────────────────────────
