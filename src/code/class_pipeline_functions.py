@@ -352,10 +352,14 @@ class ClientFeatureEngineer(BaseEstimator, TransformerMixin):
 
     def _add_hierarchy_features_for_target(self, df, target):
         """
-        Parent-level features:
-        - parent lag 1 / lag 12
-        - parent rolling mean 3 / 12
-        - subsegment share of parent using lagged values
+        Parent-level features using aggregate-then-merge approach.
+
+        Correctly computes hierarchy lags by:
+        1. Aggregating to unique parent-period series
+        2. Computing lags/rolling on that deduplicated series
+        3. Merging features back to child rows
+
+        This avoids the bug where shift() operates row-by-row instead of period-by-period when multiple children share a parent.
         """
         if not self.add_hierarchy_features:
             return df
@@ -370,31 +374,68 @@ class ClientFeatureEngineer(BaseEstimator, TransformerMixin):
                 continue
 
             level_name = "__".join(level_cols)
+            parent_keys = level_cols + [self.period_col]
+            parent_current_col = f"{target}_Parent_Current_{level_name}"
 
-            # Current-period parent total is computed internally only;
-            # it must not be kept as a feature to avoid leakage.
-            parent_curr = df.groupby(level_cols + [self.period_col], sort=False)[target].transform("sum")
-            parent_curr_col = f"{target}_ParentCurrent_{level_name}"
-            df[parent_curr_col] = parent_curr
+            # 1) Build unique parent-period series by aggregating children
+            parent_ts = (
+                df.groupby(parent_keys, dropna=False, as_index=False)[target]
+                  .sum()
+                  .sort_values(parent_keys)
+                  .reset_index(drop=True)
+            )
+            parent_ts = parent_ts.rename(columns={target: parent_current_col})
 
-            parent_grp = df.groupby(level_cols, sort=False)[parent_curr_col]
+            # 2) Compute time-series features on deduplicated parent series
+            grp = parent_ts.groupby(level_cols, dropna=False, sort=False)[parent_current_col]
 
-            df[f"{target}_Parent_Lag_1_{level_name}"] = parent_grp.shift(1)
-            df[f"{target}_Parent_Lag_12_{level_name}"] = parent_grp.shift(12)
+            parent_ts[f"{target}_Parent_Lag_1_{level_name}"] = grp.shift(1)
+            parent_ts[f"{target}_Parent_Lag_12_{level_name}"] = grp.shift(12)
 
+            for w in self.rolling_windows:
+                parent_ts[f"{target}_Parent_Rolling_Mean_{w}_{level_name}"] = (
+                    grp.transform(lambda s: s.shift(1).rolling(w, min_periods=1).mean())
+                )
+                parent_ts[f"{target}_Parent_Rolling_Std_{w}_{level_name}"] = (
+                    grp.transform(lambda s: s.shift(1).rolling(w, min_periods=2).std())
+                )
+
+            parent_ts[f"{target}_Parent_YoY_Diff_{level_name}"] = (
+                parent_ts[f"{target}_Parent_Lag_1_{level_name}"]
+                - parent_ts[f"{target}_Parent_Lag_12_{level_name}"]
+            )
+            parent_ts[f"{target}_Parent_YoY_Ratio_{level_name}"] = self._safe_divide(
+                parent_ts[f"{target}_Parent_Lag_1_{level_name}"],
+                parent_ts[f"{target}_Parent_Lag_12_{level_name}"],
+                eps=self.eps,
+            )
+
+            # 3) Merge parent features back to child rows
+            feature_cols = [
+                parent_current_col,
+                f"{target}_Parent_Lag_1_{level_name}",
+                f"{target}_Parent_Lag_12_{level_name}",
+                f"{target}_Parent_YoY_Diff_{level_name}",
+                f"{target}_Parent_YoY_Ratio_{level_name}",
+            ] + [
+                f"{target}_Parent_Rolling_Mean_{w}_{level_name}"
+                for w in self.rolling_windows
+            ] + [
+                f"{target}_Parent_Rolling_Std_{w}_{level_name}"
+                for w in self.rolling_windows
+            ]
+
+            df = df.merge(
+                parent_ts[parent_keys + feature_cols],
+                on=parent_keys,
+                how="left",
+                validate="many_to_one",
+            )
+
+            # 4) Child share of parent using lagged values only
             parent_lag1_col = f"{target}_Parent_Lag_1_{level_name}"
             parent_lag12_col = f"{target}_Parent_Lag_12_{level_name}"
 
-            parent_lag1_grp = df.groupby(level_cols, sort=False)[parent_lag1_col]
-
-            df[f"{target}_Parent_Rolling_Mean_3_{level_name}"] = parent_lag1_grp.transform(
-                lambda s: s.rolling(3, min_periods=1).mean()
-            )
-            df[f"{target}_Parent_Rolling_Mean_12_{level_name}"] = parent_lag1_grp.transform(
-                lambda s: s.rolling(12, min_periods=1).mean()
-            )
-
-            # Share of parent using lagged values only
             target_lag1 = df.get(f"{target}_Lag_1")
             if target_lag1 is not None:
                 df[f"{target}_Share_of_Parent_Lag_1_{level_name}"] = self._safe_divide(
@@ -416,9 +457,10 @@ class ClientFeatureEngineer(BaseEstimator, TransformerMixin):
                 )
 
             # Remove leakage-prone current-period parent total
-            df.drop(columns=[parent_curr_col], inplace=True)
+            df.drop(columns=[parent_current_col], inplace=True)
 
         return df
+
 
     def _add_cross_features(self, df):
         """
