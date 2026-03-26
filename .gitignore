@@ -11,3 +11,7 @@ data/prepared/validation_segment.parquet
 data/prepared/validation_subsegment.parquet
 data/prepared/validation_total.parquet
 src/code/__pycache__/eda_functions.cpython-312.pyc
+data/features/training_subsegment_fe.parquet
+data/features/validation_subsegment_fe.parquet
+src/.DS_Store
+.DS_Store
