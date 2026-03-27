@@ -2,6 +2,12 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
+import re
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.linear_model import LassoCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import RobustScaler
+from scipy.stats import spearmanr
 
 class ClientDataCleaner(BaseEstimator, TransformerMixin):
     """
@@ -689,3 +695,95 @@ class ClientFeatureSelection(BaseEstimator, TransformerMixin):
             available = [c for c in self.features_to_keep if c in df.columns]
             return df[available]
         return df
+
+# FEATURE SELECTION
+
+class FeatureSelection(BaseEstimator, TransformerMixin):
+    def __init__(self, horizon=1, lag_top_k=2, corr_threshold=0.9, min_votes=2):
+        self.horizon = horizon
+        self.lag_top_k = lag_top_k
+        self.corr_threshold = corr_threshold
+        self.min_votes = min_votes
+        self.regex = re.compile(r"_(?:Lag|Rolling|Trend|Momentum)_(\d+)")
+
+    def fit(self, X, y):
+        self.input_features_ = X.columns.tolist()
+        self.removal_log_ = {} 
+
+        # phase 1 Temporal Leak Check
+        cols_after_p1 = [c for c in X.columns if self._is_safe(c)]
+        self.removal_log_['Phase 1: Leakage'] = list(set(self.input_features_) - set(cols_after_p1))
+        
+        # phase 2 & 3 Intra-Family + Correlation Pruning
+        selected_phase3 = self._prune_features(X[cols_after_p1], y)
+        self.removal_log_['Phase 2 & 3: Correlation'] = list(set(cols_after_p1) - set(selected_phase3))
+        
+        # phase 4 Global Voting
+        X_reduced = X[selected_phase3].fillna(X[selected_phase3].median())
+        
+        # Lasso + RF
+        scaler = RobustScaler()
+        X_scaled = scaler.fit_transform(X_reduced)
+        lasso = LassoCV(cv=5).fit(X_scaled, y)
+        lasso_support = X_reduced.columns[lasso.coef_ != 0]
+        
+        rf = RandomForestRegressor(n_estimators=100, max_features="sqrt").fit(X_reduced, y)
+        rf_support = X_reduced.columns[rf.feature_importances_ > rf.feature_importances_.mean()]
+        
+        votes = pd.Series(list(lasso_support) + list(rf_support)).value_counts()
+        voted_features = votes[votes >= self.min_votes].index.tolist()
+        
+        self.removal_log_['Phase 4: Voting'] = list(set(selected_phase3) - set(voted_features))
+        
+        # phase 5 Structural Inclusion
+        structural = [c for c in cols_after_p1 if any(kw in c for kw in ["Month", "Quarter", "Parent", "Share"])]
+        
+        self.selected_features_ = list(set(voted_features + structural))
+        
+        saved_by_structure = set(structural) - set(voted_features)
+        if saved_by_structure:
+            self.removal_log_['Structural Rescue'] = list(saved_by_structure)
+
+        return self
+
+    # details about FS
+    def get_selection_report(self):
+        print("="*60)
+        print("Feature Selection Report")
+        print("="*60)
+        for phase, removed in self.removal_log_.items():
+            count = len(removed)
+            print(f"\n> {phase}: {count} variables removed")
+            if count > 0:
+                preview = ", ".join(sorted(removed)[:10])
+                print(f"  Examples: {preview}..." if count > 10 else f"  List: {preview}")
+        
+        print("\n" + "="*60)
+        print(f"FINAL RESULT: {len(self.selected_features_)} variables selected.")
+        print("="*60)
+
+    def transform(self, X):
+        return X[self.selected_features_]
+
+    def _is_safe(self, col):
+        if any(kw in col for kw in ["Month", "Quarter", "TGL", "Period"]): return True
+        match = self.regex.search(col)
+        lag = int(match.group(1)) if match else 12
+        if "_Lag_" not in col and any(kw in col for kw in ["Rolling", "Trend", "Momentum"]):
+            lag = 1
+        return lag >= self.horizon
+
+    def _prune_features(self, X, y):
+        # filter Lags by Spearman correlation with the target
+        corrs = {c: abs(spearmanr(X[c], y)[0]) for c in X.columns if "_Lag_" in c}
+        top_lags = sorted(corrs, key=corrs.get, reverse=True)[:self.lag_top_k]
+        
+        # remove redundancy (pair correl)
+        other_cols = [c for c in X.columns if "_Lag_" not in c]
+        final_cols = top_lags + other_cols
+        
+        curr_corr = X[final_cols].corr().abs()
+        upper = curr_corr.where(np.triu(np.ones(curr_corr.shape), k=1).astype(bool))
+        to_drop = [c for c in upper.columns if any(upper[c] > self.corr_threshold)]
+        
+        return [c for c in final_cols if c not in to_drop]
