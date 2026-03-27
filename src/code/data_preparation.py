@@ -301,7 +301,8 @@ def impute_gdp(macro_data: pd.DataFrame, period_data: pd.DataFrame) -> pd.DataFr
         df.groupby(["year", "quarter"])[gdp_quarterly]
         .transform(lambda x: x.bfill(limit=2))
     )
- 
+    all_gdp_cols = gdp_annual + gdp_quarterly
+    df[all_gdp_cols] = df[all_gdp_cols].ffill()
     # Drop temporary date helper columns
     df = df.drop(columns=["DATE", "year", "quarter"])
  
