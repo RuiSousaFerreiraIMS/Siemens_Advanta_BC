@@ -5,6 +5,7 @@ from sklearn.utils.validation import check_is_fitted
 import re
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.linear_model import LassoCV
+from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import RobustScaler
 from scipy.stats import spearmanr
@@ -699,11 +700,12 @@ class ClientFeatureSelection(BaseEstimator, TransformerMixin):
 # FEATURE SELECTION
 
 class FeatureSelection(BaseEstimator, TransformerMixin):
-    def __init__(self, horizon=1, lag_top_k=2, corr_threshold=0.9, min_votes=2):
+    def __init__(self, horizon=1, lag_top_k=2, corr_threshold=0.9, min_votes=1, rf_top_n=50):
         self.horizon = horizon
         self.lag_top_k = lag_top_k
         self.corr_threshold = corr_threshold
         self.min_votes = min_votes
+        self.rf_top_n = rf_top_n
         self.regex = re.compile(r"_(?:Lag|Rolling|Trend|Momentum)_(\d+)")
 
     def fit(self, X, y):
@@ -724,11 +726,26 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
         # Lasso + RF
         scaler = RobustScaler()
         X_scaled = scaler.fit_transform(X_reduced)
-        lasso = LassoCV(cv=5).fit(X_scaled, y)
+        # @elias: y_train (Revenue in EUR, values in millions) must be scaled before
+        # Lasso — otherwise the huge y scale inflates the optimal alpha to ~4M, which
+        # zeros out almost all features. RobustScaler on y normalises the penalty space
+        # so LassoCV selects a reasonable alpha. RF is scale-invariant so no change there.
+        y_scaler = RobustScaler()
+        y_scaled = y_scaler.fit_transform(y.values.reshape(-1, 1)).ravel()
+        
+        # @elias: Changed cv=5 (standard K-Fold) to TimeSeriesSplit — standard K-Fold
+        # shuffles data randomly, which leaks future into past for time series.
+        # TimeSeriesSplit always trains on past, validates on future (expanding window).
+        lasso = LassoCV(cv=TimeSeriesSplit(n_splits=5)).fit(X_scaled, y_scaled)
         lasso_support = X_reduced.columns[lasso.coef_ != 0]
         
-        rf = RandomForestRegressor(n_estimators=100, max_features="sqrt").fit(X_reduced, y)
-        rf_support = X_reduced.columns[rf.feature_importances_ > rf.feature_importances_.mean()]
+        rf = RandomForestRegressor(n_estimators=100, max_features="sqrt", random_state=42).fit(X_reduced, y)
+        # @elias: Changed from > mean threshold to top-N by importance. The > mean threshold
+        # is unstable: when a few features dominate importance, the mean is pulled up and most
+        # features fall below it, giving very few RF selections.
+        n_rf = min(self.rf_top_n, len(X_reduced.columns))
+        rf_top_indices = np.argsort(rf.feature_importances_)[-n_rf:]
+        rf_support = X_reduced.columns[rf_top_indices]
         
         votes = pd.Series(list(lasso_support) + list(rf_support)).value_counts()
         voted_features = votes[votes >= self.min_votes].index.tolist()
@@ -738,7 +755,12 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
         # phase 5 Structural Inclusion
         structural = [c for c in cols_after_p1 if any(kw in c for kw in ["Month", "Quarter", "Parent", "Share"])]
         
-        self.selected_features_ = list(set(voted_features + structural))
+        # @elias: list(set(...)) destroys column order — same data, different Python
+        # sessions can produce different orderings, which breaks reproducibility and
+        # can silently reorder features entering a model. Fixed by filtering cols_after_p1
+        # (which has a stable order) instead of converting a set to a list.
+        combined = set(voted_features) | set(structural)
+        self.selected_features_ = [c for c in cols_after_p1 if c in combined]
         
         saved_by_structure = set(structural) - set(voted_features)
         if saved_by_structure:
@@ -748,16 +770,28 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
 
     # details about FS
     def get_selection_report(self):
+        # @elias: get_selection_report() used "variables removed" for every phase,
+        # including Structural Rescue — which adds features back, not removes them.
+        # The output previously showed "Structural Rescue: 63 variables removed"
+        # which is the opposite of what happened. Fixed with phase-specific labels.
+        PHASE_LABELS = {
+            'Phase 1: Leakage': 'removed',
+            'Phase 2 & 3: Correlation': 'removed',
+            'Phase 4: Voting': 'removed',
+            'Structural Rescue': 'rescued (added back)',
+        }
+
         print("="*60)
         print("Feature Selection Report")
         print("="*60)
-        for phase, removed in self.removal_log_.items():
-            count = len(removed)
-            print(f"\n> {phase}: {count} variables removed")
+        for phase, features in self.removal_log_.items():
+            count = len(features)
+            label = PHASE_LABELS.get(phase, 'removed')
+            print(f"\n> {phase}: {count} variables {label}")
             if count > 0:
-                preview = ", ".join(sorted(removed)[:10])
+                preview = ", ".join(sorted(features)[:10])
                 print(f"  Examples: {preview}..." if count > 10 else f"  List: {preview}")
-        
+
         print("\n" + "="*60)
         print(f"FINAL RESULT: {len(self.selected_features_)} variables selected.")
         print("="*60)
@@ -774,16 +808,60 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
         return lag >= self.horizon
 
     def _prune_features(self, X, y):
-        # filter Lags by Spearman correlation with the target
-        corrs = {c: abs(spearmanr(X[c], y)[0]) for c in X.columns if "_Lag_" in c}
-        top_lags = sorted(corrs, key=corrs.get, reverse=True)[:self.lag_top_k]
-        
-        # remove redundancy (pair correl)
+        from collections import defaultdict
+
+        lag_cols = [c for c in X.columns if "_Lag_" in c]
+
+        # @elias: Added NaN-safe Spearman. Macro lag features have no NaN (macro data
+        # goes back to 2010, well before training period 1 = Jan 2022). However,
+        # Revenue and Orders lag features have structural NaN in early periods because
+        # the revenue history only starts at period 1 — e.g. Revenue_Lag_12 is NaN
+        # for periods 1–12, Orders_Lag_6 is NaN for periods 1–6.
+        # Passing those to spearmanr() directly produces NaN correlations that
+        # silently distort the top-K ranking. Fixed with non-NaN row alignment.
+        def safe_spearman(col):
+            mask = X[col].notna() & pd.Series(y, index=X.index).notna()
+            if mask.sum() < 10:
+                return 0.0
+            return abs(spearmanr(X[col][mask], pd.Series(y, index=X.index)[mask])[0])
+
+        corrs = {c: safe_spearman(c) for c in lag_cols}
+
+        # @elias: Changed from global top-K to per-family top-K.
+        # Previous code took the best lag_top_k lags across ALL lag columns globally,
+        # which could select e.g. Revenue_Lag_1/2/3 and discard every Orders and Macro
+        # lag entirely. Now we group by variable name (prefix before "_Lag_") and keep
+        # the best lag_top_k within each group, preserving diversity across families.
+        families = defaultdict(list)
+        for c in lag_cols:
+            family = c.split("_Lag_")[0]
+            families[family].append(c)
+
+        # @elias: Pairwise Pearson pruning is now done WITHIN each lag family separately,
+        # then separately for non-lag features. Previously all families were merged into
+        # a single correlation matrix, which caused cross-family drops: Orders_Lag_3 and
+        # Revenue_Lag_3 had Pearson=0.953 > 0.95, so Revenue_Lag_3 was eliminated simply
+        # because Orders columns appear first in X.columns.
+        # The fix: lags from different variable families are never pruned against each other.
+        top_lags = []
+        for family, cols in families.items():
+            sorted_cols = sorted(cols, key=lambda c: corrs.get(c, 0), reverse=True)
+            candidates = sorted_cols[:self.lag_top_k]
+            # Intra-family Pearson pruning only
+            if len(candidates) > 1:
+                X_fam = X[candidates].fillna(X[candidates].median())
+                fam_corr = X_fam.corr().abs()
+                upper_fam = fam_corr.where(np.triu(np.ones(fam_corr.shape), k=1).astype(bool))
+                fam_drop = {c for c in upper_fam.columns if any(upper_fam[c] > self.corr_threshold)}
+                candidates = [c for c in candidates if c not in fam_drop]
+            top_lags.extend(candidates)
+
+        # Pairwise Pearson pruning on non-lag features independently (not mixed with lags)
         other_cols = [c for c in X.columns if "_Lag_" not in c]
-        final_cols = top_lags + other_cols
-        
-        curr_corr = X[final_cols].corr().abs()
-        upper = curr_corr.where(np.triu(np.ones(curr_corr.shape), k=1).astype(bool))
-        to_drop = [c for c in upper.columns if any(upper[c] > self.corr_threshold)]
-        
-        return [c for c in final_cols if c not in to_drop]
+        X_other = X[other_cols].fillna(X[other_cols].median())
+        other_corr = X_other.corr().abs()
+        upper_other = other_corr.where(np.triu(np.ones(other_corr.shape), k=1).astype(bool))
+        other_drop = {c for c in upper_other.columns if any(upper_other[c] > self.corr_threshold)}
+        selected_other = [c for c in other_cols if c not in other_drop]
+
+        return top_lags + selected_other
