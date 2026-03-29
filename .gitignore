@@ -15,3 +15,10 @@ data/features/training_subsegment_fe.parquet
 data/features/validation_subsegment_fe.parquet
 src/.DS_Store
 .DS_Store
+tmp_inspect.py
+siemens_meeting_notes_en.docx
+data/features/training_subsegment_fs.parquet
+data/features/validation_subsegment_fs.parquet
+src/code/__pycache__/baseline_models.cpython-311.pyc
+src/code/__pycache__/class_pipeline_functions.cpython-312.pyc
+src/code/__pycache__/baseline_models.cpython-312.pyc
