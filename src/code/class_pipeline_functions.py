@@ -700,12 +700,12 @@ class ClientFeatureSelection(BaseEstimator, TransformerMixin):
 # FEATURE SELECTION
 
 class FeatureSelection(BaseEstimator, TransformerMixin):
-    def __init__(self, horizon=1, lag_top_k=2, corr_threshold=0.9, min_votes=1, rf_top_n=50):
+    def __init__(self, horizon=1, lag_top_k=2, corr_threshold=0.9, min_votes=1, rf_cum_threshold=0.90):
         self.horizon = horizon
         self.lag_top_k = lag_top_k
         self.corr_threshold = corr_threshold
         self.min_votes = min_votes
-        self.rf_top_n = rf_top_n
+        self.rf_cum_threshold = rf_cum_threshold
         self.regex = re.compile(r"_(?:Lag|Rolling|Trend|Momentum)_(\d+)")
 
     def fit(self, X, y):
@@ -740,10 +740,20 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
         lasso_support = X_reduced.columns[lasso.coef_ != 0]
         
         rf = RandomForestRegressor(n_estimators=100, max_features="sqrt", random_state=42).fit(X_reduced, y)
-        # @elias: Changed from > mean threshold to top-N by importance. The > mean threshold
-        # is unstable: when a few features dominate importance, the mean is pulled up and most
-        # features fall below it, giving very few RF selections.
-        n_rf = min(self.rf_top_n, len(X_reduced.columns))
+        # @bruna: Changed from fixed top-N (rf_top_n=50) to cumulative importance
+        # threshold. A hard cap of 50 is arbitrary and fragile: if RF concentrates
+        # importance in 15 features, top-50 passes 35 near-zero-importance features
+        # that add noise; if the signal is spread across 80, top-50 drops useful ones.
+        # Instead, we keep the fewest features whose cumulative importance reaches
+        # rf_cum_threshold (default 90%) of the total. This adapts to the actual
+        # importance profile of each fold. A floor of 10 prevents over-pruning when
+        # importance is extremely concentrated, and a ceiling of N_features prevents
+        # selecting more features than available.
+        importances_sorted = np.sort(rf.feature_importances_)[::-1]
+        cumulative = np.cumsum(importances_sorted)
+        
+        n_for_threshold = np.searchsorted(cumulative, self.rf_cum_threshold * cumulative[-1]) + 1
+        n_rf = np.clip(n_for_threshold, 10, len(X_reduced.columns))
         rf_top_indices = np.argsort(rf.feature_importances_)[-n_rf:]
         rf_support = X_reduced.columns[rf_top_indices]
         
