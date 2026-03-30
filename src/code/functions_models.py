@@ -492,7 +492,14 @@ def build_segment_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDER
     for w in [3, 6]:
         agg[f'Rev_Trend_Slope_{w}'] = g.transform(
             lambda x: x.shift(1).rolling(w, min_periods=3).apply(
-                lambda v: np.polyfit(range(len(v)), v, 1)[0] if len(v) >= 3 else np.nan, raw=True))
+                lambda v: (
+                    np.polyfit(range(len(v)), v, 1)[0]
+                    if len(v) >= 3 and np.isfinite(v).all() and np.std(v) > 0
+                    else np.nan
+                ),
+                raw=True
+            )
+        )
 
     print(f'Segment-level dataset: {agg.shape}')
     return agg
