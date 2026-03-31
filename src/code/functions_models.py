@@ -424,7 +424,7 @@ def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
 
 
 # === EXPANDING-WINDOW CV ===
-def expanding_window_cv(df, feature_cols, cat_cols, model_template, needs_preproc,
+def expanding_window_cv(df, feature_cols, cat_cols, model_template, needs_preproc, group_cols,
                         min_train_periods=30, horizon=6, target=DEFAULT_TARGET,
                         period_col=DEFAULT_PERIOD_COL, subseg_col=DEFAULT_SUBSEG_COL,
                         bu_col=DEFAULT_BU_COL):
@@ -443,14 +443,15 @@ def expanding_window_cv(df, feature_cols, cat_cols, model_template, needs_prepro
             fitted, pp = fit_model(mdl, tf[feature_cols], tf[target].values,
                                    needs_preproc, cat_cols, feature_cols)
             preds = recursive_forecast(fitted, tf, vf, feature_cols,
-                needs_preprocessing=needs_preproc, preprocessors=pp,
-                cat_cols=cat_cols, target=target, period_col=period_col,
-                subseg_col=subseg_col, bu_col=bu_col)
+                                       group_cols=group_cols,
+                                       needs_preprocessing=needs_preproc, preprocessors=pp,
+                                       cat_cols=cat_cols, target=target, period_col=period_col)
             m = compute_metrics(vf[target].values, preds, '', '')
             folds.append({'cutoff': cutoff, 'val_range': f'{vs}-{ve}',
                 'RMSE': m['RMSE'], 'MAE': m['MAE'], 'R2': m['R2'],
                 'n_train': len(tf), 'n_val': len(vf)})
         except:
+            print(f'Fold {cutoff} failed: {e}')
             folds.append({'cutoff': cutoff, 'val_range': f'{vs}-{ve}',
                 'RMSE': np.nan, 'MAE': np.nan, 'R2': np.nan,
                 'n_train': len(tf), 'n_val': len(vf)})
