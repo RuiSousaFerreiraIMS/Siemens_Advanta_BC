@@ -697,54 +697,68 @@ class ClientFeatureSelection(BaseEstimator, TransformerMixin):
             return df[available]
         return df
 
+
 # FEATURE SELECTION
 
 class FeatureSelection(BaseEstimator, TransformerMixin):
+    """
+    4-phase adaptive feature selection pipeline for time-series forecasting.
+
+    Phase 1 & 2 — Correlation Pruning:
+        Per-family Spearman ranking (top-K lags per variable family) followed
+        by intra-family Pearson redundancy removal. Non-lag features are pruned
+        independently to avoid cross-family interference.
+    Phase 3 — Ensemble Consensus Voting:
+        LassoCV (linear) and Random Forest (non-linear) each nominate features;
+        only those receiving >= min_votes survive.
+    Phase 4 — Structural Rescue:
+        Business-critical features (seasonality, hierarchy shares) are
+        unconditionally included to preserve domain interpretability.
+
+    Attributes (set after fit)
+    --------------------------
+    selected_features_ : list[str]   — Final feature set in stable column order.
+    removal_log_       : dict        — Features removed/rescued at each phase.
+    input_features_    : list[str]   — Original columns received by fit().
+    """
+
     def __init__(self, horizon=1, lag_top_k=2, corr_threshold=0.9, min_votes=1, rf_cum_threshold=0.90):
-        self.horizon = horizon
-        self.lag_top_k = lag_top_k
-        self.corr_threshold = corr_threshold
-        self.min_votes = min_votes
-        self.rf_cum_threshold = rf_cum_threshold
+        self.horizon = horizon              # forecast horizon (unused after Phase 1 removal, kept for API compat)
+        self.lag_top_k = lag_top_k          # max lags to keep per variable family
+        self.corr_threshold = corr_threshold  # Pearson threshold for redundancy pruning
+        self.min_votes = min_votes          # minimum model votes to survive Phase 3
+        self.rf_cum_threshold = rf_cum_threshold  # cumulative importance cutoff for RF (default 90%)
         self.regex = re.compile(r"_(?:Lag|Rolling|Trend|Momentum)_(\d+)")
 
     def fit(self, X, y):
         self.input_features_ = X.columns.tolist()
         self.removal_log_ = {} 
 
-        # phase 1 Temporal Leak Check
-        cols_after_p1 = [c for c in X.columns if self._is_safe(c)]
-        self.removal_log_['Phase 1: Leakage'] = list(set(self.input_features_) - set(cols_after_p1))
+        # phase 1 & 2 Intra-Family + Correlation Pruning
+        all_cols = X.columns.tolist()
+        selected_phase2 = self._prune_features(X, y)
+        self.removal_log_['Phase 1 & 2: Correlation'] = list(set(all_cols) - set(selected_phase2))
         
-        # phase 2 & 3 Intra-Family + Correlation Pruning
-        selected_phase3 = self._prune_features(X[cols_after_p1], y)
-        self.removal_log_['Phase 2 & 3: Correlation'] = list(set(cols_after_p1) - set(selected_phase3))
-        
-        # phase 4 Global Voting
-        X_reduced = X[selected_phase3].fillna(X[selected_phase3].median())
+        # phase 3 Global Voting
+        X_reduced = X[selected_phase2].fillna(X[selected_phase2].median())
         
         # Lasso + RF
         scaler = RobustScaler()
         X_scaled = scaler.fit_transform(X_reduced)
-        # @elias: y_train (Revenue in EUR, values in millions) must be scaled before
+        # y_train (Revenue in EUR, values in millions) must be scaled before
         # Lasso — otherwise the huge y scale inflates the optimal alpha to ~4M, which
         # zeros out almost all features. RobustScaler on y normalises the penalty space
         # so LassoCV selects a reasonable alpha. RF is scale-invariant so no change there.
         y_scaler = RobustScaler()
         y_scaled = y_scaler.fit_transform(y.values.reshape(-1, 1)).ravel()
         
-        # @elias: Changed cv=5 (standard K-Fold) to TimeSeriesSplit — standard K-Fold
-        # shuffles data randomly, which leaks future into past for time series.
-        # TimeSeriesSplit always trains on past, validates on future (expanding window).
+        # TimeSeriesSplit always trains on past, validates on future (expanding window) 
+        # and preventing data leakage.
         lasso = LassoCV(cv=TimeSeriesSplit(n_splits=5)).fit(X_scaled, y_scaled)
-        lasso_support = X_reduced.columns[lasso.coef_ != 0]
+        lasso_support = X_reduced.columns[lasso.coef_ != 0]  # features with non-zero Lasso coefficients
         
         rf = RandomForestRegressor(n_estimators=100, max_features="sqrt", random_state=42).fit(X_reduced, y)
-        # @bruna: Changed from fixed top-N (rf_top_n=50) to cumulative importance
-        # threshold. A hard cap of 50 is arbitrary and fragile: if RF concentrates
-        # importance in 15 features, top-50 passes 35 near-zero-importance features
-        # that add noise; if the signal is spread across 80, top-50 drops useful ones.
-        # Instead, we keep the fewest features whose cumulative importance reaches
+        # keep the fewest features whose cumulative importance reaches
         # rf_cum_threshold (default 90%) of the total. This adapts to the actual
         # importance profile of each fold. A floor of 10 prevents over-pruning when
         # importance is extremely concentrated, and a ceiling of N_features prevents
@@ -760,17 +774,13 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
         votes = pd.Series(list(lasso_support) + list(rf_support)).value_counts()
         voted_features = votes[votes >= self.min_votes].index.tolist()
         
-        self.removal_log_['Phase 4: Voting'] = list(set(selected_phase3) - set(voted_features))
+        self.removal_log_['Phase 3: Voting'] = list(set(selected_phase2) - set(voted_features))
         
-        # phase 5 Structural Inclusion
-        structural = [c for c in cols_after_p1 if any(kw in c for kw in ["Month", "Quarter", "Parent", "Share"])]
+        # phase 4 Structural Inclusion
+        structural = [c for c in all_cols if any(kw in c for kw in ["Month", "Quarter", "Parent", "Share"])]
         
-        # @elias: list(set(...)) destroys column order — same data, different Python
-        # sessions can produce different orderings, which breaks reproducibility and
-        # can silently reorder features entering a model. Fixed by filtering cols_after_p1
-        # (which has a stable order) instead of converting a set to a list.
         combined = set(voted_features) | set(structural)
-        self.selected_features_ = [c for c in cols_after_p1 if c in combined]
+        self.selected_features_ = [c for c in all_cols if c in combined]
         
         saved_by_structure = set(structural) - set(voted_features)
         if saved_by_structure:
@@ -780,14 +790,11 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
 
     # details about FS
     def get_selection_report(self):
-        # @elias: get_selection_report() used "variables removed" for every phase,
-        # including Structural Rescue — which adds features back, not removes them.
-        # The output previously showed "Structural Rescue: 63 variables removed"
-        # which is the opposite of what happened. Fixed with phase-specific labels.
+        """Print a human-readable summary of features removed/rescued at each phase."""
+
         PHASE_LABELS = {
-            'Phase 1: Leakage': 'removed',
-            'Phase 2 & 3: Correlation': 'removed',
-            'Phase 4: Voting': 'removed',
+            'Phase 1 & 2: Correlation': 'removed',
+            'Phase 3: Voting': 'removed',
             'Structural Rescue': 'rescued (added back)',
         }
 
@@ -807,28 +814,26 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
         print("="*60)
 
     def transform(self, X):
+        """Subset X to the features selected during fit."""
         return X[self.selected_features_]
 
-    def _is_safe(self, col):
-        if any(kw in col for kw in ["Month", "Quarter", "TGL", "Period"]): return True
-        match = self.regex.search(col)
-        lag = int(match.group(1)) if match else 12
-        if "_Lag_" not in col and any(kw in col for kw in ["Rolling", "Trend", "Momentum"]):
-            lag = 1
-        return lag >= self.horizon
-
     def _prune_features(self, X, y):
+        """
+        Two-step feature pruning:
+          1. Per-family Spearman ranking → keep top-K lags per variable family.
+          2. Intra-family Pearson pruning → remove highly correlated survivors.
+        Non-lag features are pruned separately to avoid cross-family interference.
+        """
         from collections import defaultdict
 
         lag_cols = [c for c in X.columns if "_Lag_" in c]
 
-        # @elias: Added NaN-safe Spearman. Macro lag features have no NaN (macro data
-        # goes back to 2010, well before training period 1 = Jan 2022). However,
-        # Revenue and Orders lag features have structural NaN in early periods because
+        # Macro lag features have no NaN (macro data goes back to 2010, well before training period 1 = Jan 2022).
+        # However,Revenue and Orders lag features have structural NaN in early periods because
         # the revenue history only starts at period 1 — e.g. Revenue_Lag_12 is NaN
         # for periods 1–12, Orders_Lag_6 is NaN for periods 1–6.
         # Passing those to spearmanr() directly produces NaN correlations that
-        # silently distort the top-K ranking. Fixed with non-NaN row alignment.
+        # silently distort the top-K ranking, fixed with non-NaN row alignment.
         def safe_spearman(col):
             mask = X[col].notna() & pd.Series(y, index=X.index).notna()
             if mask.sum() < 10:
@@ -837,27 +842,21 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
 
         corrs = {c: safe_spearman(c) for c in lag_cols}
 
-        # @elias: Changed from global top-K to per-family top-K.
-        # Previous code took the best lag_top_k lags across ALL lag columns globally,
-        # which could select e.g. Revenue_Lag_1/2/3 and discard every Orders and Macro
-        # lag entirely. Now we group by variable name (prefix before "_Lag_") and keep
+        # Group by variable name (prefix before "_Lag_") and keep
         # the best lag_top_k within each group, preserving diversity across families.
         families = defaultdict(list)
         for c in lag_cols:
             family = c.split("_Lag_")[0]
             families[family].append(c)
 
-        # @elias: Pairwise Pearson pruning is now done WITHIN each lag family separately,
-        # then separately for non-lag features. Previously all families were merged into
-        # a single correlation matrix, which caused cross-family drops: Orders_Lag_3 and
-        # Revenue_Lag_3 had Pearson=0.953 > 0.95, so Revenue_Lag_3 was eliminated simply
-        # because Orders columns appear first in X.columns.
-        # The fix: lags from different variable families are never pruned against each other.
+        # Pairwise Pearson pruning is done within each lag family separately,
+        # then separately for non-lag features.
+        # Lags from different variable families are never pruned against each other.
         top_lags = []
         for family, cols in families.items():
             sorted_cols = sorted(cols, key=lambda c: corrs.get(c, 0), reverse=True)
             candidates = sorted_cols[:self.lag_top_k]
-            # Intra-family Pearson pruning only
+            # Intra-family Pearson pruning 
             if len(candidates) > 1:
                 X_fam = X[candidates].fillna(X[candidates].median())
                 fam_corr = X_fam.corr().abs()
@@ -866,7 +865,7 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
                 candidates = [c for c in candidates if c not in fam_drop]
             top_lags.extend(candidates)
 
-        # Pairwise Pearson pruning on non-lag features independently (not mixed with lags)
+        # Pairwise Pearson pruning on non-lag features independently 
         other_cols = [c for c in X.columns if "_Lag_" not in c]
         X_other = X[other_cols].fillna(X[other_cols].median())
         other_corr = X_other.corr().abs()
@@ -874,4 +873,4 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
         other_drop = {c for c in upper_other.columns if any(upper_other[c] > self.corr_threshold)}
         selected_other = [c for c in other_cols if c not in other_drop]
 
-        return top_lags + selected_other
+        return top_lags + selected_other  # final Phase 1 & 2 survivors
