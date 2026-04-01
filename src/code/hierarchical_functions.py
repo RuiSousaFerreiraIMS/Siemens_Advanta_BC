@@ -244,8 +244,23 @@ def evaluate_mint(reconciled_df, train_full, target, period_col,
                       .groupby([period_col] + group_cols)[target]
                       .sum().reset_index())
 
-        y_true = actuals[target].values
-        y_pred = level_hat[mint_col].values
+        # Construct `unique_id` inside actuals to match `level_hat`
+        if level_name == 'BU':
+            actuals['unique_id'] = actuals[c1].astype(str)
+        elif level_name == 'Segment':
+            actuals['unique_id'] = actuals[c1].astype(str) + '/' + actuals[c2].astype(str)
+        elif level_name == 'Subsegment':
+            actuals['unique_id'] = actuals[c1].astype(str) + '/' + actuals[c2].astype(str) + '/' + actuals[c3].astype(str)
+
+        # Merge them to perfectly align periods and dropped sparse series
+        merged = pd.merge(actuals, level_hat, left_on=['unique_id', period_col], right_on=['unique_id', 'ds'], how='inner')
+
+        y_true = merged[target].values
+        y_pred = merged[mint_col].values
+
+        if len(y_true) == 0:
+            print(f"Warning: No overlapping series found for {level_name} level evaluation.")
+            continue
 
         m = compute_metrics(y_true, y_pred, f'MinT ({level_name})', level_name)
         results.append(m)
