@@ -440,6 +440,61 @@ def run_chronos(subsegments, train_df, val_df, period_col, target,
     
     return results, errors
 
+# ──────────────────────────────────────────────────────────────────────────────
+# ETS
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run_ets(subsegments, train_df, val_df, period_col, target, horizon=6):
+    """
+    Fits Holt-Winters ETS per subsegment.
+    Uses additive trend + additive seasonality (m=12) if series is long enough,
+    falls back to simple exponential smoothing for short series.
+    """
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+
+    results = {}
+    errors  = {}
+    n = len(subsegments)
+
+    for i, seg in enumerate(subsegments, 1):
+        if i % 25 == 0:
+            print(f'  ETS progress: {i}/{n} subsegments...')
+        series = get_subsegment_series(train_df, seg, period_col, target).dropna()
+        try:
+            if len(series) >= 24:
+                # Full Holt-Winters com sazonalidade
+                model = ExponentialSmoothing(
+                    series,
+                    trend='add',
+                    seasonal='add',
+                    seasonal_periods=12,
+                    initialization_method='estimated'
+                )
+            elif len(series) >= 6:
+                # Só tendência, sem sazonalidade (série curta)
+                model = ExponentialSmoothing(
+                    series,
+                    trend='add',
+                    seasonal=None,
+                    initialization_method='estimated'
+                )
+            else:
+                # Fallback: média histórica
+                results[seg] = np.full(horizon, series.mean())
+                continue
+
+            fit = model.fit(optimized=True, remove_bias=True)
+            forecast = fit.forecast(horizon).values
+            # Clip para evitar extrapolações absurdas
+            clip = np.abs(series).max() * 5
+            results[seg] = np.clip(forecast, -clip, clip)
+
+        except Exception as ex:
+            errors[seg] = str(ex)
+            results[seg] = np.full(horizon, series.mean())
+
+    print(f'  ETS done. Errors: {len(errors)}/{n}')
+    return results, errors
 
 # ──────────────────────────────────────────────────────────────────────────────
 # VISUALIZATION

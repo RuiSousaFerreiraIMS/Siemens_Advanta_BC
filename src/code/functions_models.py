@@ -106,6 +106,7 @@ _RE_LAG          = re.compile(r'_Lag_(\d+)', re.I)
 _RE_ROLLING_MEAN = re.compile(r'_Rolling_Mean_(\d+)', re.I)
 _RE_ROLLING_STD  = re.compile(r'_Rolling_Std_(\d+)', re.I)
 _RE_YOY_DIFF     = re.compile(r'_YoY_Diff$', re.I)
+_RE_YOY_RAT      = re.compile(r'_YoY_Ratio$', re.I)
 _RE_TREND        = re.compile(r'_Trend_(\d+)', re.I)
 _RE_TREND_SLOPE  = re.compile(r'_Trend_Slope_(\d+)', re.I)
 _RE_MOMENTUM     = re.compile(r'_Momentum_(\d+)_(\d+)', re.I)
@@ -117,7 +118,7 @@ _ALL_PATTERNS = [
     _RE_PARENT_YOY_DIFF, _RE_PARENT_YOY_RAT,
     _RE_SHARE_PARENT, _RE_SHARE_PAR_YOY,
     _RE_LAG, _RE_ROLLING_MEAN, _RE_ROLLING_STD,
-    _RE_YOY_DIFF, _RE_TREND, _RE_TREND_SLOPE,
+    _RE_YOY_DIFF, _RE_YOY_RAT, _RE_TREND, _RE_TREND_SLOPE,
     _RE_MOMENTUM, _RE_CV, _RE_ZERO_SHARE,
 ]
 
@@ -141,8 +142,8 @@ def _slope(vals, mc=3):
 
 def _is_rev(col):
     cl = col.lower()
-    return ('rev' in cl or 'revenue' in cl) and not any(
-        t in cl for t in ('gdp','cpi','france','china','japan','united','macro','pmi','confidence'))
+    blocked = ('gdp','cpi','france','china','japan','united','macro','pmi','confidence','ord','order','asp')
+    return ('rev' in cl or 'revenue' in cl) and not any(t in cl for t in blocked)
 
 
 def recompute_lag_features(history, period, entity_key, feature_cols):
@@ -188,6 +189,70 @@ def recompute_lag_features(history, period, entity_key, feature_cols):
             else:
                 updates[col] = np.nan
             continue
+            
+        # 5. YoY Difference
+        m = _RE_YOY_DIFF.search(col)
+        if m:
+            val_t1 = history.get((entity_key, period - 1), np.nan)
+            val_t13 = history.get((entity_key, period - 13), np.nan)
+            if not np.isnan(val_t1) and not np.isnan(val_t13):
+                updates[col] = val_t1 - val_t13
+            else:
+                updates[col] = np.nan
+            continue
+            
+        # 6. YoY Ratio
+        m = _RE_YOY_RAT.search(col)
+        if m:
+            val_t1 = history.get((entity_key, period - 1), np.nan)
+            val_t13 = history.get((entity_key, period - 13), np.nan)
+            if not np.isnan(val_t1) and not np.isnan(val_t13) and abs(val_t13) > 1e-8:
+                updates[col] = val_t1 / val_t13
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 7. Momentum
+        m = _RE_MOMENTUM.search(col)
+        if m:
+            short_w = int(m.group(1))
+            long_w  = int(m.group(2))
+            vals_s = [history.get((entity_key, period - x), np.nan) for x in range(1, short_w + 1)]
+            s_mean = np.nanmean(vals_s) if any(~np.isnan(vals_s)) else np.nan
+            
+            vals_l = [history.get((entity_key, period - x), np.nan) for x in range(1, long_w + 1)]
+            l_mean = np.nanmean(vals_l) if any(~np.isnan(vals_l)) else np.nan
+            
+            if not np.isnan(s_mean) and not np.isnan(l_mean):
+                updates[col] = s_mean - l_mean
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 8. Coefficient of Variation (CV)
+        m = _RE_CV.search(col)
+        if m:
+            w = int(m.group(1))
+            vals = [history.get((entity_key, period - x), np.nan) for x in range(1, w + 1)]
+            mean_v = np.nanmean(vals) if any(~np.isnan(vals)) else np.nan
+            std_v = np.nanstd(vals) if len([x for x in vals if not np.isnan(x)]) >= 2 else np.nan
+            if not np.isnan(mean_v) and not np.isnan(std_v) and abs(mean_v) > 1e-8:
+                updates[col] = std_v / mean_v
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 9. Zero Share
+        m = _RE_ZERO_SHARE.search(col)
+        if m:
+            w = int(m.group(1))
+            vals = [history.get((entity_key, period - x), np.nan) for x in range(1, w + 1)]
+            clean_v = [x for x in vals if not np.isnan(x)]
+            if len(clean_v) > 0:
+                updates[col] = sum(1 for x in clean_v if abs(x) < 1e-8) / w
+            else:
+                updates[col] = np.nan
+            continue
 
     return updates
 
@@ -230,19 +295,56 @@ def diagnose_feature_coverage(feature_cols, subseg_col=DEFAULT_SUBSEG_COL,
 def get_models(cat_cols, feature_cols):
     cat_idx = [feature_cols.index(c) for c in cat_cols if c in feature_cols]
     models = {
-        'LightGBM': (lgb.LGBMRegressor(n_estimators=500, learning_rate=0.05,
-            num_leaves=31, min_child_samples=20, subsample=0.8,
-            colsample_bytree=0.8, random_state=42, verbosity=-1, n_jobs=-1), False),
-        'XGBoost': (xgb.XGBRegressor(n_estimators=500, learning_rate=0.05,
-            max_depth=6, subsample=0.8, colsample_bytree=0.8, random_state=42,
-            verbosity=0, enable_categorical=True, tree_method='hist'), False),
-        'Ridge': (Ridge(alpha=1.0, random_state=42), True),
-        'Lasso': (Lasso(alpha=1.0, random_state=42, max_iter=5000), True),
-        'ElasticNet': (ElasticNet(alpha=1.0, l1_ratio=0.5, random_state=42, max_iter=5000), True),
-        'Random Forest': (RandomForestRegressor(n_estimators=300, max_depth=15,
-            min_samples_leaf=10, random_state=42, n_jobs=-1), True),
-        'Gradient Boosting': (GradientBoostingRegressor(n_estimators=300,
-            learning_rate=0.05, max_depth=5, min_samples_leaf=10, random_state=42), True),
+        'LightGBM': (lgb.LGBMRegressor(
+            n_estimators=300,        # era 500
+            learning_rate=0.05,
+            num_leaves=15,           # era 31 — menos folhas = menos complexidade
+            min_child_samples=30,    # era 20 — mais amostras por folha
+            subsample=0.7,           # era 0.8
+            colsample_bytree=0.7,    # era 0.8
+            reg_alpha=0.1,           # L1 — novo
+            reg_lambda=1.0,          # L2 — novo
+            random_state=42, verbosity=-1, n_jobs=-1), False),
+
+        'XGBoost': (xgb.XGBRegressor(
+            n_estimators=300,        # era 500
+            learning_rate=0.05,
+            max_depth=4,             # era 6
+            min_child_weight=5,      # novo — evita splits em poucos pontos
+            subsample=0.7,           # era 0.8
+            colsample_bytree=0.7,    # era 0.8
+            reg_alpha=0.1,           # L1 — novo
+            reg_lambda=1.0,          # L2 — novo
+            random_state=42, verbosity=0,
+            enable_categorical=True, tree_method='hist'), False),
+
+        'Ridge': (Ridge(
+            alpha=10.0,              # era 1.0 — mais regularização
+            random_state=42), True),
+
+        'Lasso': (Lasso(
+            alpha=10.0,              # era 1.0
+            random_state=42, max_iter=5000), True),
+
+        'ElasticNet': (ElasticNet(
+            alpha=10.0,              # era 1.0
+            l1_ratio=0.5,
+            random_state=42, max_iter=5000), True),
+
+        'Random Forest': (RandomForestRegressor(
+            n_estimators=200,        # era 300
+            max_depth=8,             # era 15 — muito profundo para poucos dados
+            min_samples_leaf=20,     # era 10
+            max_features=0.6,        # novo — subsample de features
+            random_state=42, n_jobs=-1), True),
+
+        'Gradient Boosting': (GradientBoostingRegressor(
+            n_estimators=200,        # era 300
+            learning_rate=0.05,
+            max_depth=3,             # era 5
+            min_samples_leaf=20,     # era 10
+            subsample=0.7,           # novo
+            random_state=42), True),
     }
     if _HAS_CATBOOST:
         models['CatBoost'] = (CatBoostRegressor(iterations=500, learning_rate=0.05,
@@ -317,11 +419,13 @@ def _update_parent_history(ph, history, df_slice, period, subseg_col, bu_col):
 
 def recursive_forecast(model, train_df, val_df, feature_cols, group_cols,
                        needs_preprocessing=False, preprocessors=None,
-                       cat_cols=None, target=DEFAULT_TARGET,
-                       period_col=DEFAULT_PERIOD_COL):
+                       cat_cols=None, target=DEFAULT_TARGET, absolute_target=DEFAULT_TARGET,
+                       period_col=DEFAULT_PERIOD_COL, predicts_delta=False):
     """
     Performs step-by-step forecasting, updating lags with previous predictions.
     Works for any granularity level defined in 'group_cols'.
+    If predicts_delta=True, the model predicts the differenced target. It will 
+    automatically reconstruct the absolute target before updating history.
     """
     if cat_cols is None: cat_cols = []
 
@@ -329,16 +433,16 @@ def recursive_forecast(model, train_df, val_df, feature_cols, group_cols,
     def get_entity_key(row):
         return tuple(row[c] for c in group_cols) if isinstance(group_cols, list) else row[group_cols]
 
-    # Initialize history with known training values
+    # Initialize history with known training values (ALWAYS absolute)
     history = {}
     for _, row in train_df.iterrows():
-        history[(get_entity_key(row), row[period_col])] = row[target]
+        history[(get_entity_key(row), row[period_col])] = row[absolute_target]
 
     val = val_df.copy()
-    all_preds = np.zeros(len(val))
+    all_preds_abs = np.zeros(len(val))
 
     # Security clip to prevent recursive error explosion
-    train_max = np.nanmax(np.abs(train_df[target].values))
+    train_max = np.nanmax(np.abs(train_df[absolute_target].values))
     clip_val = train_max * 5
 
     # Iterate through each period in the validation set sequentially
@@ -360,74 +464,152 @@ def recursive_forecast(model, train_df, val_df, feature_cols, group_cols,
         else:
             preds = model.predict(X_p)
 
+        # C. Reconstruct absolute values if predicting deltas
+        if predicts_delta:
+            abs_preds = []
+            for idx_orig, p_delta in zip(indices, preds):
+                entity = get_entity_key(val.loc[idx_orig])
+                prev_abs = history.get((entity, period - 1), np.nan)
+                if np.isnan(prev_abs): # Fallback
+                    prev_abs = 0.0 
+                abs_preds.append(prev_abs + p_delta)
+            preds = np.array(abs_preds)    
+
         preds = np.clip(preds, -clip_val, clip_val)
 
-        # C. Update global prediction array and history for next steps (t+1, t+2...)
+        # D. Update global prediction array and history for next steps
         mask_idx_positions = np.where(mask.values)[0]
         for m_pos, p_val in zip(mask_idx_positions, preds):
-            all_preds[m_pos] = p_val
+            all_preds_abs[m_pos] = p_val
 
         for idx_orig, p_val in zip(indices, preds):
             history[(get_entity_key(val.loc[idx_orig]), period)] = p_val
 
-    return all_preds
+    return all_preds_abs
 
 # === BENCHMARKING ===
 def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
                             level_name, group_cols,
-                            models=None, target=DEFAULT_TARGET,
-                            period_col=DEFAULT_PERIOD_COL):
+                            models=None, target=DEFAULT_TARGET, absolute_target=DEFAULT_TARGET,
+                            period_col=DEFAULT_PERIOD_COL, predicts_delta=False):
     """
     Clones, fits, and evaluates multiple models using the recursive engine.
+
+    Returns
+    -------
+    results       : list[dict] — metrics per model (RMSE, MAE, wMAPE, R2, ...)
+    all_forecasts : dict[str, dict] — per-model forecasts by entity key
+                    Structure: { model_name: { entity_key: np.array(H) } }
+                    entity_key matches group_cols (e.g. (bu, seg, sub) for Subsegment)
     """
     if models is None:
         models = get_models(cat_cols, feature_cols)
 
-    # Temporal Split
+    # Temporal split
     train_df = train_full[train_full[period_col] <= val_cutoff].copy()
-    val_df = train_full[train_full[period_col] > val_cutoff].copy()
-    y_val = val_df[target].values
-    results = []
+    val_df   = train_full[train_full[period_col] > val_cutoff].copy()
+    y_val    = val_df[absolute_target].values
+
+    # Pre-compute entity keys and val periods (needed to build forecast dicts)
+    def get_entity_key(row):
+        return tuple(row[c] for c in group_cols) if isinstance(group_cols, list) else row[group_cols]
+
+    val_periods  = sorted(val_df[period_col].unique())
+    entity_index = [(get_entity_key(val_df.loc[i]), val_df.loc[i, period_col])
+                    for i in val_df.index]
+
+    results       = []
+    all_forecasts = {}   # { model_name: { entity_key: np.array(H) } }
+    all_fitted    = {}   # { model_name: { entity_key: np.array(T) } }
 
     for name, (template, needs_pp) in models.items():
         print(f'  {name} @ {level_name} ...', end=' ', flush=True)
         t0 = time.time()
         try:
-            # Fit Model
+            # ── Fit ────────────────────────────────────────────────────────
             mdl = clone(template)
             X_tr = train_df[feature_cols]
             y_tr = train_df[target].values
             fitted, pp = fit_model(mdl, X_tr, y_tr, needs_pp, cat_cols, feature_cols)
 
-            # Recursive Prediction
-            preds = recursive_forecast(
+            # Train R² for overfitting diagnostics
+            preds_tr  = (predict_with_model(fitted, X_tr, True, pp, cat_cols, feature_cols)
+                         if needs_pp and pp else fitted.predict(X_tr))
+            train_r2  = r2_score(y_tr, preds_tr)
+
+
+            # In-sample fitted values por série (para MinT mint_shrink)
+            fitted_values = {}
+            if needs_pp and pp:
+                preds_tr_full = predict_with_model(fitted, X_tr, True, pp, cat_cols, feature_cols)
+            else:
+                preds_tr_full = fitted.predict(X_tr)
+
+            # Map to entity_key → {period: fitted_value}
+            for idx, pred_val in zip(train_df.index, preds_tr_full):
+                entity = get_entity_key(train_df.loc[idx])
+                period = train_df.loc[idx, period_col]
+                if entity not in fitted_values:
+                    fitted_values[entity] = {}
+                fitted_values[entity][period] = pred_val
+
+            # Map to entity_key → np.array(H) sorted by period
+            fitted_values = {
+                ek: np.array([pdict[p] for p in sorted(pdict)])
+                for ek, pdict in fitted_values.items()
+            }
+            all_fitted[name] = fitted_values
+
+            # ── Recursive forecast ─────────────────────────────────────────
+            preds_flat = recursive_forecast(
                 fitted, train_df, val_df, feature_cols,
-                group_cols=group_cols,
-                needs_preprocessing=needs_pp,
-                preprocessors=pp,
-                cat_cols=cat_cols,
-                target=target,
-                period_col=period_col
+                group_cols        = group_cols,
+                needs_preprocessing = needs_pp,
+                preprocessors     = pp,
+                cat_cols          = cat_cols,
+                target            = target,
+                absolute_target   = absolute_target,
+                period_col        = period_col,
+                predicts_delta    = predicts_delta
             )
 
-            # Metric Calculation
-            m = compute_metrics(y_val, preds, name, level_name)
-            m['Time (s)'] = round(time.time() - t0, 1)
+            # ── Build per-entity forecast dict ─────────────────────────────
+            # preds_flat is a flat array aligned with val_df rows.
+            # We reshape it into { entity_key: np.array(H) } for MinT.
+            entity_forecasts = {}
+            for (entity_key, period), pred_val in zip(entity_index, preds_flat):
+                if entity_key not in entity_forecasts:
+                    entity_forecasts[entity_key] = {}
+                entity_forecasts[entity_key][period] = pred_val
+
+            # Convert inner dict {period: value} → np.array sorted by period
+            entity_forecasts = {
+                ek: np.array([pdict[p] for p in sorted(pdict)])
+                for ek, pdict in entity_forecasts.items()
+            }
+            all_forecasts[name] = entity_forecasts
+
+            # ── Metrics ────────────────────────────────────────────────────
+            m = compute_metrics(y_val, preds_flat, name, level_name)
+            m['Time (s)']  = round(time.time() - t0, 1)
+            m['Train R2']  = round(train_r2, 6)
             results.append(m)
-            print(f'RMSE: {m["RMSE"]:>14,.0f} | {m["Time (s)"]}s')
+            print(f'Val RMSE: {m["RMSE"]:>14,.0f} | Train R²: {train_r2:>7.4f} | {m["Time (s)"]}s')
 
         except Exception as e:
             print(f'FAILED - {str(e)}')
             results.append({'Model': name, 'Level': level_name, 'RMSE': np.nan})
+            all_forecasts[name] = {}
+            all_fitted[name] = {}
 
-    return results
+    return results, all_forecasts, all_fitted
 
 
 # === EXPANDING-WINDOW CV ===
 def expanding_window_cv(df, feature_cols, cat_cols, model_template, needs_preproc, group_cols,
-                        min_train_periods=30, horizon=6, target=DEFAULT_TARGET,
+                        min_train_periods=30, horizon=6, target=DEFAULT_TARGET, absolute_target=DEFAULT_TARGET,
                         period_col=DEFAULT_PERIOD_COL, subseg_col=DEFAULT_SUBSEG_COL,
-                        bu_col=DEFAULT_BU_COL):
+                        bu_col=DEFAULT_BU_COL, predicts_delta=False):
     df = df.copy()
     max_p = df[period_col].max()
     for c in cat_cols:
@@ -445,8 +627,9 @@ def expanding_window_cv(df, feature_cols, cat_cols, model_template, needs_prepro
             preds = recursive_forecast(fitted, tf, vf, feature_cols,
                                        group_cols=group_cols,
                                        needs_preprocessing=needs_preproc, preprocessors=pp,
-                                       cat_cols=cat_cols, target=target, period_col=period_col)
-            m = compute_metrics(vf[target].values, preds, '', '')
+                                       cat_cols=cat_cols, target=target, absolute_target=absolute_target, period_col=period_col,
+                                       predicts_delta=predicts_delta)
+            m = compute_metrics(vf[absolute_target].values, preds, '', '')
             folds.append({'cutoff': cutoff, 'val_range': f'{vs}-{ve}',
                 'RMSE': m['RMSE'], 'MAE': m['MAE'], 'R2': m['R2'],
                 'n_train': len(tf), 'n_val': len(vf)})
@@ -487,7 +670,7 @@ def build_segment_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDER
         agg[f'Rev_Rolling_Mean_{w}'] = g.transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
         agg[f'Rev_Rolling_Std_{w}'] = g.transform(lambda x: x.shift(1).rolling(w, min_periods=2).std())
 
-    agg['Rev_YoY_Diff'] = g.diff(12)
+    agg['Rev_YoY_Diff'] = g.transform(lambda x: x.shift(1).diff(12))
 
     # Trend Slopes
     for w in [3, 6]:
@@ -504,3 +687,69 @@ def build_segment_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDER
 
     print(f'Segment-level dataset: {agg.shape}')
     return agg
+
+# === BU-LEVEL DATA PREPARATION ===
+def build_bu_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDERS_COL,
+                        period_col=DEFAULT_PERIOD_COL, bu_col=DEFAULT_BU_COL):
+    """
+    Aggregates data at the Business Unit level and computes lag features.
+    """
+    agg = df.groupby([period_col, bu_col]).agg(
+        {target: 'sum', orders_col: 'sum'}).reset_index()
+
+    # Carry over macro features
+    mcols = [c for c in df.columns if any(t in c for t in [
+        'GDP', 'France', 'Month', 'Quarter', 'Industrial',
+        'China', 'Japan', 'United', 'CPI', 'PMI',
+        'Confidence', 'Unemployment', 'Interest', 'Exchange', 'Construction'
+    ])]
+    if mcols:
+        mdf = df.groupby(period_col)[mcols].first().reset_index()
+        agg = agg.merge(mdf, on=period_col, how='left')
+
+    agg = agg.sort_values([bu_col, period_col]).reset_index(drop=True)
+
+    g = agg.groupby(bu_col)[target]
+
+    for lag in [1, 3, 12]:
+        agg[f'Rev_Lag_{lag}'] = g.shift(lag)
+
+    for w in [3, 6, 12]:
+        agg[f'Rev_Rolling_Mean_{w}'] = g.transform(lambda x: x.shift(1).rolling(w, min_periods=1).mean())
+        agg[f'Rev_Rolling_Std_{w}']  = g.transform(lambda x: x.shift(1).rolling(w, min_periods=2).std())
+
+    agg['Rev_YoY_Diff'] = g.transform(lambda x: x.shift(1).diff(12))
+
+    for w in [3, 6]:
+        agg[f'Rev_Trend_Slope_{w}'] = g.transform(
+            lambda x: x.shift(1).rolling(w, min_periods=3).apply(
+                lambda v: (
+                    np.polyfit(range(len(v)), v, 1)[0]
+                    if len(v) >= 3 and np.isfinite(v).all() and np.std(v) > 0
+                    else np.nan
+                ),
+                raw=True
+            )
+        )
+
+    print(f'BU-level dataset: {agg.shape}')
+    return agg
+
+
+def prepare_bu_data(bu_df, val_cutoff, target=DEFAULT_TARGET,
+                    orders_col=DEFAULT_ORDERS_COL,
+                    period_col=DEFAULT_PERIOD_COL,
+                    bu_col=DEFAULT_BU_COL,
+                    orders_strategy='drop'):
+    cat_cols = [bu_col]
+    drop_cols = [period_col, target, orders_col]
+    feature_cols = [c for c in bu_df.columns if c not in drop_cols]
+    feature_cols = filter_leaky_features(feature_cols, orders_strategy)
+    bu_df = bu_df.copy()
+    for c in cat_cols:
+        if c in feature_cols:
+            bu_df[c] = bu_df[c].astype('category')
+    train = bu_df[bu_df[period_col] <= val_cutoff].copy()
+    val   = bu_df[bu_df[period_col] > val_cutoff].copy()
+    return (train[feature_cols], train[target].values,
+            val[feature_cols], val[target].values, feature_cols, cat_cols)
