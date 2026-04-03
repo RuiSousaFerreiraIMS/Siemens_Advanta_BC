@@ -3,11 +3,11 @@ import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.utils.validation import check_is_fitted
 import re
-from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.linear_model import LassoCV
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import RobustScaler
+from sklearn.feature_selection import VarianceThreshold, mutual_info_regression
 from scipy.stats import spearmanr
 
 class ClientDataCleaner(BaseEstimator, TransformerMixin):
@@ -702,15 +702,20 @@ class ClientFeatureSelection(BaseEstimator, TransformerMixin):
 
 class FeatureSelection(BaseEstimator, TransformerMixin):
     """
-    4-phase adaptive feature selection pipeline for time-series forecasting.
+    5-phase adaptive feature selection pipeline for time-series forecasting.
 
+    Phase 0 — VarianceThreshold:
+        Removes quasi-constant features before any correlation analysis.
+        Near-zero-variance columns produce NaN Spearman scores that distort
+        the Phase 1 top-K ranking; removing them first keeps rankings clean.
     Phase 1 & 2 — Correlation Pruning:
         Per-family Spearman ranking (top-K lags per variable family) followed
         by intra-family Pearson redundancy removal. Non-lag features are pruned
         independently to avoid cross-family interference.
-    Phase 3 — Ensemble Consensus Voting:
-        LassoCV (linear) and Random Forest (non-linear) each nominate features;
-        only those receiving >= min_votes survive.
+    Phase 3 — Ensemble Consensus Voting (3 voters):
+        LassoCV (linear), Random Forest (non-linear interactions), and Mutual
+        Information (non-linear, non-monotone) each nominate features; only
+        those receiving >= min_votes survive.
     Phase 4 — Structural Rescue:
         Business-critical features (seasonality, hierarchy shares) are
         unconditionally included to preserve domain interpretability.
@@ -720,68 +725,99 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
     selected_features_ : list[str]   — Final feature set in stable column order.
     removal_log_       : dict        — Features removed/rescued at each phase.
     input_features_    : list[str]   — Original columns received by fit().
+    lasso_support_     : set[str]    — Features nominated by LassoCV.
+    rf_support_        : set[str]    — Features nominated by Random Forest.
+    mi_support_        : set[str]    — Features nominated by Mutual Information.
     """
 
-    def __init__(self, horizon=1, lag_top_k=2, corr_threshold=0.9, min_votes=1, rf_cum_threshold=0.90):
-        self.horizon = horizon              # forecast horizon (unused after Phase 1 removal, kept for API compat)
-        self.lag_top_k = lag_top_k          # max lags to keep per variable family
-        self.corr_threshold = corr_threshold  # Pearson threshold for redundancy pruning
-        self.min_votes = min_votes          # minimum model votes to survive Phase 3
+    def __init__(self, horizon=1, lag_top_k=2, corr_threshold=0.95, min_votes=1,
+                 rf_cum_threshold=0.90, vt_threshold=0.0, mi_threshold=1.75):
+
+
+        self.horizon = horizon                    # forecast horizon (unused after Phase 1 removal, kept for API compat)
+        self.lag_top_k = lag_top_k                # max lags to keep per variable family
+        self.corr_threshold = corr_threshold      # Pearson threshold for redundancy pruning
+        self.min_votes = min_votes                # minimum model votes to survive Phase 3 (default 2 of 3)
         self.rf_cum_threshold = rf_cum_threshold  # cumulative importance cutoff for RF (default 90%)
+        self.vt_threshold = vt_threshold          # variance threshold for Phase 0 (0.0 removes only constants)
+        self.mi_threshold = mi_threshold          # MI multiplier on mean score (1.0 = above mean, nominates ~50%)
         self.regex = re.compile(r"_(?:Lag|Rolling|Trend|Momentum)_(\d+)")
 
     def fit(self, X, y):
-        self.input_features_ = X.columns.tolist()
-        self.removal_log_ = {} 
-
-        # phase 1 & 2 Intra-Family + Correlation Pruning
+        self.input_features_ = X.columns.tolist()  # full pre-VT column list (used for funnel reporting)
+        self.removal_log_ = {}
         all_cols = X.columns.tolist()
-        selected_phase2 = self._prune_features(X, y)
-        self.removal_log_['Phase 1 & 2: Correlation'] = list(set(all_cols) - set(selected_phase2))
-        
-        # phase 3 Global Voting
+
+        # Phase 0: VarianceThreshold — remove quasi-constant features before correlation ranking.
+        # Near-zero-variance columns produce NaN Spearman correlations that safe_spearman() fills
+        # with 0.0, silently distorting the Phase 1 top-K ranking.
+        vt = VarianceThreshold(threshold=self.vt_threshold)
+        vt.fit(X.fillna(X.median()))
+        surviving_cols = X.columns[vt.get_support()].tolist()
+        self.removal_log_['Phase 0: VarianceThreshold'] = list(set(all_cols) - set(surviving_cols))
+        X_vt = X[surviving_cols]
+
+        # Phase 1 & 2: Intra-family Spearman ranking + intra-family Pearson pruning
+        # Run on VT-filtered columns only so quasi-constant features don't distort rankings.
+        selected_phase2 = self._prune_features(X_vt, y)
+        self.removal_log_['Phase 1 & 2: Correlation'] = list(set(surviving_cols) - set(selected_phase2))
+
+        # Phase 3: Ensemble consensus voting — Lasso (linear) + RF (interactions) + MI (non-linear)
         X_reduced = X[selected_phase2].fillna(X[selected_phase2].median())
-        
-        # Lasso + RF
+
         scaler = RobustScaler()
         X_scaled = scaler.fit_transform(X_reduced)
-        # y_train (Revenue in EUR, values in millions) must be scaled before
-        # Lasso — otherwise the huge y scale inflates the optimal alpha to ~4M, which
-        # zeros out almost all features. RobustScaler on y normalises the penalty space
-        # so LassoCV selects a reasonable alpha. RF is scale-invariant so no change there.
+
+        # y must be scaled before Lasso: raw Revenue values (EUR, millions) inflate the optimal
+        # alpha to ~4M, zeroing almost all features. RobustScaler normalises the penalty space.
+        # RF and MI are scale-invariant but MI voter also receives y_scaled for consistency.
         y_scaler = RobustScaler()
         y_scaled = y_scaler.fit_transform(y.values.reshape(-1, 1)).ravel()
-        
-        # TimeSeriesSplit always trains on past, validates on future (expanding window) 
-        # and preventing data leakage.
+
+        # Voter 1: LassoCV — linear signal, TimeSeriesSplit prevents look-ahead bias
         lasso = LassoCV(cv=TimeSeriesSplit(n_splits=5)).fit(X_scaled, y_scaled)
-        lasso_support = X_reduced.columns[lasso.coef_ != 0]  # features with non-zero Lasso coefficients
-        
+        lasso_support = X_reduced.columns[lasso.coef_ != 0]
+
+        # Voter 2: Random Forest — captures non-linear interactions and feature importance
+        # Cumulative importance threshold: keep fewest features reaching rf_cum_threshold of
+        # total Gini importance. Floor of 10 prevents over-pruning on concentrated importances.
         rf = RandomForestRegressor(n_estimators=100, max_features="sqrt", random_state=42).fit(X_reduced, y)
-        # keep the fewest features whose cumulative importance reaches
-        # rf_cum_threshold (default 90%) of the total. This adapts to the actual
-        # importance profile of each fold. A floor of 10 prevents over-pruning when
-        # importance is extremely concentrated, and a ceiling of N_features prevents
-        # selecting more features than available.
         importances_sorted = np.sort(rf.feature_importances_)[::-1]
         cumulative = np.cumsum(importances_sorted)
-        
         n_for_threshold = np.searchsorted(cumulative, self.rf_cum_threshold * cumulative[-1]) + 1
         n_rf = np.clip(n_for_threshold, 10, len(X_reduced.columns))
         rf_top_indices = np.argsort(rf.feature_importances_)[-n_rf:]
         rf_support = X_reduced.columns[rf_top_indices]
-        
-        votes = pd.Series(list(lasso_support) + list(rf_support)).value_counts()
+
+        # Voter 3: Mutual Information — captures non-linear, non-monotone patterns that
+        # Lasso (linear) and RF (tree splits) can miss. n_neighbors=10 for stable MI estimates.
+        # Threshold is relative (mean MI score) so MI always nominates the top ~50% of features
+        # by signal strength, regardless of absolute score scale. mi_threshold acts as a floor
+        # multiplier: 1.0 = above mean, >1.0 = stricter, <1.0 = more permissive.
+        mi_scores = mutual_info_regression(
+            X_reduced.fillna(X_reduced.median()),
+            y_scaled,
+            n_neighbors=3,
+            random_state=42,
+        )
+        mi_cutoff = mi_scores.mean() * self.mi_threshold
+        mi_support = X_reduced.columns[mi_scores > mi_cutoff]
+
+        self.lasso_support_ = set(lasso_support)
+        self.rf_support_    = set(rf_support)
+        self.mi_support_    = set(mi_support)
+
+        votes = pd.Series(list(lasso_support) + list(rf_support) + list(mi_support)).value_counts()
         voted_features = votes[votes >= self.min_votes].index.tolist()
-        
         self.removal_log_['Phase 3: Voting'] = list(set(selected_phase2) - set(voted_features))
-        
-        # phase 4 Structural Inclusion
-        structural = [c for c in all_cols if any(kw in c for kw in ["Month", "Quarter", "Parent", "Share"])]
-        
+
+        # Phase 4: Structural Rescue — unconditionally include business-critical features.
+        # Iterate over surviving_cols (not all_cols) so VT-removed columns cannot re-enter
+        # via keyword matches (e.g. a constant "Month" dummy would otherwise sneak back in).
+        structural = [c for c in surviving_cols if any(kw in c for kw in ["Month", "Quarter", "Parent", "Share"])]
         combined = set(voted_features) | set(structural)
-        self.selected_features_ = [c for c in all_cols if c in combined]
-        
+        self.selected_features_ = [c for c in surviving_cols if c in combined]
+
         saved_by_structure = set(structural) - set(voted_features)
         if saved_by_structure:
             self.removal_log_['Structural Rescue'] = list(saved_by_structure)
@@ -793,6 +829,7 @@ class FeatureSelection(BaseEstimator, TransformerMixin):
         """Print a human-readable summary of features removed/rescued at each phase."""
 
         PHASE_LABELS = {
+            'Phase 0: VarianceThreshold': 'removed',
             'Phase 1 & 2: Correlation': 'removed',
             'Phase 3: Voting': 'removed',
             'Structural Rescue': 'rescued (added back)',
