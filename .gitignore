@@ -22,3 +22,4 @@ data/features/validation_subsegment_fs.parquet
 src/code/__pycache__/baseline_models.cpython-311.pyc
 src/code/__pycache__/class_pipeline_functions.cpython-312.pyc
 src/code/__pycache__/baseline_models.cpython-312.pyc
+/data/results/
