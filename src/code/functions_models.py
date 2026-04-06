@@ -855,3 +855,271 @@ def plot_forecast_comparison(
     plt.show()
 
     return output_path
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MinT RECONCILIATION — Minimum Trace (Wickramasuriya et al. 2019)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def build_hierarchy_map(df, bu_col=DEFAULT_BU_COL, seg_col=DEFAULT_SEG_COL,
+                        subseg_col=DEFAULT_SUBSEG_COL):
+    """
+    Build the hierarchy mapping from the training data.
+
+    Returns
+    -------
+    hier : dict with keys:
+        'bottom_keys'  : list of (bu, seg, sub) — one per bottom-level series
+        'seg_keys'     : list of (bu, seg)      — one per segment series
+        'bu_keys'      : list of (bu,)          — one per BU series
+        'S'            : np.ndarray (n_all × n_bottom) summing matrix
+    """
+    triples = sorted(set(zip(df[bu_col], df[seg_col], df[subseg_col])))
+    seg_keys = sorted(set((bu, seg) for bu, seg, _ in triples))
+    bu_keys = sorted(set((bu,) for bu, _, _ in triples))
+
+    bottom_keys = triples
+    n_b = len(bottom_keys)
+    n_s = len(seg_keys)
+    n_u = len(bu_keys)
+    n_all = 1 + n_u + n_s + n_b  # Total + BU + Segment + Subsegment
+
+    # Summing matrix S: rows = all nodes, cols = bottom-level only
+    # Order: [Total, BU_0..BU_u, Seg_0..Seg_s, Bottom_0..Bottom_b]
+    S = np.zeros((n_all, n_b))
+
+    # Total row: sums all bottom
+    S[0, :] = 1.0
+
+    # BU rows
+    bu_idx = {k: i for i, k in enumerate(bu_keys)}
+    for j, (bu, seg, sub) in enumerate(bottom_keys):
+        S[1 + bu_idx[(bu,)], j] = 1.0
+
+    # Segment rows
+    seg_idx = {k: i for i, k in enumerate(seg_keys)}
+    for j, (bu, seg, sub) in enumerate(bottom_keys):
+        S[1 + n_u + seg_idx[(bu, seg)], j] = 1.0
+
+    # Bottom rows: identity
+    S[1 + n_u + n_s:, :] = np.eye(n_b)
+
+    return {
+        'bottom_keys': bottom_keys,
+        'seg_keys': seg_keys,
+        'bu_keys': bu_keys,
+        'S': S,
+        'n_total': 1, 'n_bu': n_u, 'n_seg': n_s, 'n_bottom': n_b,
+    }
+
+
+def _assemble_forecast_matrix(fc_sub, fc_seg, fc_bu, hier, horizon):
+    """
+    Stacks base forecasts from all levels into a (n_all × H) matrix.
+    """
+    n_all = hier['n_total'] + hier['n_bu'] + hier['n_seg'] + hier['n_bottom']
+    Y = np.zeros((n_all, horizon))
+
+    total = np.zeros(horizon)
+    for i, bk in enumerate(hier['bu_keys']):
+        vals = fc_bu.get(bk, np.zeros(horizon))
+        Y[1 + i, :] = vals
+        total += vals
+    Y[0, :] = total
+
+    n_u = hier['n_bu']
+    for i, sk in enumerate(hier['seg_keys']):
+        Y[1 + n_u + i, :] = fc_seg.get(sk, np.zeros(horizon))
+
+    n_s = hier['n_seg']
+    for i, bk in enumerate(hier['bottom_keys']):
+        Y[1 + n_u + n_s + i, :] = fc_sub.get(bk, np.zeros(horizon))
+
+    return Y
+
+
+def _compute_residual_covariance(fitted_sub, fitted_seg, fitted_bu,
+                                 actuals_sub, actuals_seg, actuals_bu,
+                                 hier, method='mint_shrink'):
+    """
+    Compute the W_h matrix (covariance of reconciliation errors).
+
+    method: 'ols' | 'wls_struct' | 'wls_var' | 'mint_shrink'
+    """
+    n_all = hier['n_total'] + hier['n_bu'] + hier['n_seg'] + hier['n_bottom']
+
+    if method == 'ols':
+        return np.eye(n_all)
+
+    if method == 'wls_struct':
+        S = hier['S']
+        diag_vals = S @ np.ones(hier['n_bottom'])
+        return np.diag(diag_vals)
+
+    # For wls_var and mint_shrink, compute residuals
+    def _get_residuals(fitted_dict, actuals_dict, keys):
+        res_list = []
+        for k in keys:
+            if k in fitted_dict and k in actuals_dict:
+                f = np.asarray(fitted_dict[k], dtype=float)
+                a = np.asarray(actuals_dict[k], dtype=float)
+                min_len = min(len(f), len(a))
+                res_list.append(a[:min_len] - f[:min_len])
+            else:
+                res_list.append(np.array([0.0]))
+        return res_list
+
+    bu_res = _get_residuals(fitted_bu, actuals_bu, hier['bu_keys'])
+    max_T = max(len(r) for r in bu_res) if bu_res else 1
+    total_res = np.zeros(max_T)
+    for r in bu_res:
+        total_res[:len(r)] += r
+
+    residual_matrix = [total_res]
+
+    for r in bu_res:
+        padded = np.zeros(max_T)
+        padded[:len(r)] = r
+        residual_matrix.append(padded)
+
+    seg_res = _get_residuals(fitted_seg, actuals_seg, hier['seg_keys'])
+    for r in seg_res:
+        padded = np.zeros(max_T)
+        padded[:len(r)] = r
+        residual_matrix.append(padded)
+
+    sub_res = _get_residuals(fitted_sub, actuals_sub, hier['bottom_keys'])
+    for r in sub_res:
+        padded = np.zeros(max_T)
+        padded[:len(r)] = r
+        residual_matrix.append(padded)
+
+    E = np.column_stack(residual_matrix)  # (T × n_all)
+
+    if method == 'wls_var':
+        variances = np.var(E, axis=0, ddof=1)
+        variances = np.maximum(variances, 1e-8)
+        return np.diag(variances)
+
+    # mint_shrink: Ledoit-Wolf shrinkage
+    T, n = E.shape
+    if T < 2:
+        return np.eye(n_all)
+
+    E_centered = E - E.mean(axis=0, keepdims=True)
+    S_hat = (E_centered.T @ E_centered) / (T - 1)
+    F = np.diag(np.diag(S_hat))
+
+    sum_var_sij = 0.0
+    sum_sij2 = 0.0
+    for i in range(n):
+        for j in range(i + 1, n):
+            s_ij = S_hat[i, j]
+            var_sij = np.mean((E_centered[:, i] * E_centered[:, j] - s_ij) ** 2) / T
+            sum_var_sij += var_sij
+            sum_sij2 += s_ij ** 2
+
+    if sum_sij2 > 0:
+        lam = min(max(sum_var_sij / sum_sij2, 0.0), 1.0)
+    else:
+        lam = 1.0
+
+    W = (1 - lam) * S_hat + lam * F
+
+    eigvals = np.linalg.eigvalsh(W)
+    if eigvals.min() < 1e-10:
+        W += np.eye(n) * (1e-8 - eigvals.min())
+
+    return W
+
+
+def mint_reconcile(fc_sub, fc_seg, fc_bu,
+                   fitted_sub, fitted_seg, fitted_bu,
+                   actuals_sub, actuals_seg, actuals_bu,
+                   hier, horizon=6, method='mint_shrink',
+                   non_negative=True):
+    """
+    Reconcile base forecasts using MinT (Minimum Trace).
+
+    Returns
+    -------
+    reconciled_sub, reconciled_seg, reconciled_bu, reconciled_total
+    """
+    S = hier['S']
+    n_all, n_b = S.shape
+
+    Y_hat = _assemble_forecast_matrix(fc_sub, fc_seg, fc_bu, hier, horizon)
+
+    W = _compute_residual_covariance(
+        fitted_sub, fitted_seg, fitted_bu,
+        actuals_sub, actuals_seg, actuals_bu,
+        hier, method=method
+    )
+
+    try:
+        W_inv = np.linalg.inv(W)
+    except np.linalg.LinAlgError:
+        print('  [MinT] W singular — falling back to pseudo-inverse')
+        W_inv = np.linalg.pinv(W)
+
+    StWinv = S.T @ W_inv
+    StWinvS = StWinv @ S
+
+    try:
+        StWinvS_inv = np.linalg.inv(StWinvS)
+    except np.linalg.LinAlgError:
+        StWinvS_inv = np.linalg.pinv(StWinvS)
+
+    P = StWinvS_inv @ StWinv
+    Y_tilde_bottom = P @ Y_hat
+
+    if non_negative:
+        Y_tilde_bottom = np.maximum(Y_tilde_bottom, 0.0)
+
+    Y_tilde = S @ Y_tilde_bottom
+
+    n_u = hier['n_bu']
+    n_s = hier['n_seg']
+
+    reconciled_total = Y_tilde[0, :]
+
+    reconciled_bu = {}
+    for i, bk in enumerate(hier['bu_keys']):
+        reconciled_bu[bk] = Y_tilde[1 + i, :]
+
+    reconciled_seg = {}
+    for i, sk in enumerate(hier['seg_keys']):
+        reconciled_seg[sk] = Y_tilde[1 + n_u + i, :]
+
+    reconciled_sub = {}
+    for i, bk in enumerate(hier['bottom_keys']):
+        reconciled_sub[bk] = Y_tilde[1 + n_u + n_s + i, :]
+
+    base_total = Y_hat[0, :]
+    pct_change = np.abs(reconciled_total - base_total) / (np.abs(base_total) + 1e-8) * 100
+    print(f'  [MinT] Avg change per period: {pct_change.mean():.1f}%')
+
+    return reconciled_sub, reconciled_seg, reconciled_bu, reconciled_total
+
+
+def build_actuals_dict(df, group_cols, target=DEFAULT_TARGET,
+                       period_col=DEFAULT_PERIOD_COL):
+    """
+    Build { entity_key: np.array(T) } of actual values from a DataFrame.
+    """
+    actuals = {}
+
+    def get_key(row):
+        return tuple(row[c] for c in group_cols) if isinstance(group_cols, list) else (row[group_cols],)
+
+    for _, row in df.iterrows():
+        k = get_key(row)
+        p = row[period_col]
+        if k not in actuals:
+            actuals[k] = {}
+        actuals[k][p] = row[target]
+
+    return {
+        ek: np.array([pdict[p] for p in sorted(pdict)])
+        for ek, pdict in actuals.items()
+    }
