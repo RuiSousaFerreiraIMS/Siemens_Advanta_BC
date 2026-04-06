@@ -24,3 +24,8 @@ src/code/__pycache__/class_pipeline_functions.cpython-312.pyc
 src/code/__pycache__/baseline_models.cpython-312.pyc
 /data/results/
 notebooks/final_reconciled_forecasts.csv
+notebooks/catboost_info/catboost_training.json
+notebooks/catboost_info/learn_error.tsv
+notebooks/catboost_info/time_left.tsv
+notebooks/catboost_info/learn/events.out.tfevents
+notebooks/forecast_plot_direct_multi-step_+_mint.png

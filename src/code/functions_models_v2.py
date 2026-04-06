@@ -20,6 +20,8 @@ from sklearn.linear_model import Ridge, Lasso, ElasticNet
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 import lightgbm as lgb
 import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 try:
     from catboost import CatBoostRegressor
@@ -989,3 +991,146 @@ def prepare_bu_data(bu_df, val_cutoff, target=DEFAULT_TARGET,
     val   = bu_df[bu_df[period_col] > val_cutoff].copy()
     return (train[feature_cols], train[target].values,
             val[feature_cols], val[target].values, feature_cols, cat_cols)
+
+
+
+def plot_forecast_comparison(
+    train_df,
+    submission_df,
+    period_col,
+    target_col,
+    best_model_name,
+    output_dir,
+    forecast_col="Revenue cons. (anon)",
+    hist_periods_label="Historical Revenue (periods 1–42)",
+    forecast_periods_label=None
+):
+    """
+    Generates a chart comparing aggregated historical revenue vs. aggregated forecast.
+
+    Parameters
+    ----------
+    train_df : pd.DataFrame
+        Training dataset containing historical values.
+    submission_df : pd.DataFrame
+        Dataset containing forecasted values.
+    period_col : str
+        Name of the period column (must exist in both train_df and submission_df).
+    target_col : str
+        Name of the historical target column in train_df.
+    best_model_name : str
+        Name of the model (used in title and filename).
+    output_dir : Path
+        Directory where the PNG file will be saved.
+    forecast_col : str, optional
+        Name of the forecast column in the submission file.
+    hist_periods_label : str, optional
+        Label for the historical area.
+    forecast_periods_label : str, optional
+        Label for the forecast area (default uses model name).
+    """
+
+    # Default label for forecast area
+    if forecast_periods_label is None:
+        forecast_periods_label = f"{best_model_name} Forecast (periods 43–48)"
+
+    # Aggregate historical and forecast values by period
+    hist = (
+        train_df.groupby(period_col)[target_col]
+        .sum()
+        .sort_index()
+    )
+    fore = (
+        submission_df.groupby(period_col)[forecast_col]
+        .sum()
+        .sort_index()
+    )
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(14, 5))
+
+    # Historical area + line
+    ax.fill_between(
+        hist.index, hist.values,
+        alpha=0.75, color="#378ADD",
+        label=hist_periods_label
+    )
+    ax.plot(hist.index, hist.values, color="#185FA5", linewidth=0.8)
+
+    # Forecast area + line
+    ax.fill_between(
+        fore.index, fore.values,
+        alpha=0.80, color="#D85A30",
+        label=forecast_periods_label
+    )
+    ax.plot(
+        fore.index, fore.values,
+        color="#993C1D",
+        linewidth=2, marker="o", markersize=6, zorder=5
+    )
+
+    # Annotate forecast values (in millions)
+    for period, val in fore.items():
+        ax.annotate(
+            f"{val/1e6:.0f}M",
+            xy=(period, val),
+            xytext=(0, 10),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8.5,
+            color="#993C1D",
+            fontweight="500"
+        )
+
+    # Vertical line separating historical vs forecast
+    ax.axvline(
+        hist.index.max() + 0.5,
+        color="#888780",
+        linewidth=1.5,
+        linestyle="--",
+        alpha=0.8
+    )
+    ax.text(
+        hist.index.max() + 0.7,
+        ax.get_ylim()[1] * 0.97,
+        "forecast →",
+        fontsize=9,
+        color="#888780",
+        va="top"
+    )
+
+    # Format y-axis in millions
+    ax.yaxis.set_major_formatter(
+        plt.FuncFormatter(lambda x, _: f"{x/1e6:.0f}M")
+    )
+
+    # Labels and title
+    ax.set_xlabel("Period", fontsize=11)
+    ax.set_ylabel("Total Revenue", fontsize=11)
+    ax.set_title(
+        f"{best_model_name} — Historical Revenue & Forecast "
+        f"(Subsegment level, all series aggregated)",
+        fontsize=12,
+        pad=12
+    )
+
+    # Legend and layout
+    ax.legend(fontsize=10, loc="upper left")
+    ax.set_xlim(hist.index.min(), max(fore.index) + 1)
+    sns.despine()
+    plt.tight_layout()
+
+    # Safer filename
+    safe_name = (
+        best_model_name.lower()
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+    output_path = output_dir / f"forecast_plot_{safe_name}.png"
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
+    plt.show()
+
+    return output_path
