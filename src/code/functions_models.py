@@ -1,8 +1,15 @@
 """
-functions_models.py - ML forecasting pipeline.
+functions_models.py - ML forecasting pipeline (FINAL).
 
 Recursive multi-step forecasting with leak-free evaluation
 for hierarchical revenue prediction (Siemens Advanta BC).
+
+Key fixes vs original version:
+1. CatBoost cloning fix — cat_features removed from constructor; passed in .fit() instead.
+2. Parent feature regex fix — added explicit parent-level patterns with negative lookbehinds
+   so base _RE_LAG / _RE_ROLLING_MEAN etc. no longer accidentally match Parent_ columns.
+3. Parent aggregation in recursive_forecast — history now tracks BU-level and Segment-level
+   aggregates so parent lag features are properly recomputed each step.
 """
 
 import re, time, warnings
@@ -16,6 +23,8 @@ from sklearn.linear_model import Ridge, Lasso, ElasticNet
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
 import lightgbm as lgb
 import xgboost as xgb
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 try:
     from catboost import CatBoostRegressor
@@ -95,18 +104,30 @@ def prepare_segment_data(seg_df, val_cutoff, target=DEFAULT_TARGET,
             val[feature_cols], val[target].values, feature_cols, cat_cols)
 
 # === LAG FEATURE RECOMPUTATION ===
-_RE_PARENT_LAG      = re.compile(r'Parent_Lag_(\d+)', re.I)
-_RE_PARENT_RMEAN    = re.compile(r'Parent_Rolling_Mean_(\d+)', re.I)
-_RE_PARENT_RSTD     = re.compile(r'Parent_Rolling_Std_(\d+)', re.I)
-_RE_PARENT_YOY_DIFF = re.compile(r'Parent_YoY_Diff', re.I)
-_RE_PARENT_YOY_RAT  = re.compile(r'Parent_YoY_Ratio', re.I)
-_RE_SHARE_PARENT    = re.compile(r'Share_of_Parent_Lag_(\d+)', re.I)
-_RE_SHARE_PAR_YOY   = re.compile(r'Share_of_Parent_YoY', re.I)
-_RE_LAG          = re.compile(r'_Lag_(\d+)', re.I)
-_RE_ROLLING_MEAN = re.compile(r'_Rolling_Mean_(\d+)', re.I)
-_RE_ROLLING_STD  = re.compile(r'_Rolling_Std_(\d+)', re.I)
-_RE_YOY_DIFF     = re.compile(r'_YoY_Diff$', re.I)
-_RE_YOY_RAT      = re.compile(r'_YoY_Ratio$', re.I)
+# FIX: Parent-specific patterns MUST come before child patterns to avoid mismatches.
+# We also add "(?<!Parent)" negative lookbehinds on base patterns to prevent them
+# from matching strings like "Revenue_Parent_Lag_1_TGL Business Unit".
+#
+# Pattern naming convention from feature engineering:
+#   Child:  <metric>_Lag_N, <metric>_Rolling_Mean_N, etc.
+#   Parent: <metric>_Parent_Lag_N_<parent_level>, <metric>_Parent_Rolling_Mean_N_<parent_level>
+#           <metric>_Share_of_Parent_Lag_N_<parent_level>, etc.
+
+# Parent-level patterns (priority — match FIRST)
+_RE_PARENT_LAG      = re.compile(r'_Parent_Lag_(\d+)_(.+)', re.I)
+_RE_PARENT_RMEAN    = re.compile(r'_Parent_Rolling_Mean_(\d+)_(.+)', re.I)
+_RE_PARENT_RSTD     = re.compile(r'_Parent_Rolling_Std_(\d+)_(.+)', re.I)
+_RE_PARENT_YOY_DIFF = re.compile(r'_Parent_YoY_Diff_(.+)', re.I)
+_RE_PARENT_YOY_RAT  = re.compile(r'_Parent_YoY_Ratio_(.+)', re.I)
+_RE_SHARE_PARENT_LAG    = re.compile(r'_Share_of_Parent_Lag_(\d+)_(.+)', re.I)
+_RE_SHARE_PARENT_YOY    = re.compile(r'_Share_of_Parent_YoY_Diff_(.+)', re.I)
+
+# Child-level patterns — negative lookbehind ensures "Parent_Lag_1" is NOT caught here
+_RE_LAG          = re.compile(r'(?<!Parent)_Lag_(\d+)', re.I)
+_RE_ROLLING_MEAN = re.compile(r'(?<!Parent)_Rolling_Mean_(\d+)', re.I)
+_RE_ROLLING_STD  = re.compile(r'(?<!Parent)_Rolling_Std_(\d+)', re.I)
+_RE_YOY_DIFF     = re.compile(r'(?<!Parent)_YoY_Diff$', re.I)
+_RE_YOY_RAT      = re.compile(r'(?<!Parent)_YoY_Ratio$', re.I)
 _RE_TREND        = re.compile(r'_Trend_(\d+)', re.I)
 _RE_TREND_SLOPE  = re.compile(r'_Trend_Slope_(\d+)', re.I)
 _RE_MOMENTUM     = re.compile(r'_Momentum_(\d+)_(\d+)', re.I)
@@ -116,7 +137,7 @@ _RE_ZERO_SHARE   = re.compile(r'_Zero_Share_(\d+)', re.I)
 _ALL_PATTERNS = [
     _RE_PARENT_LAG, _RE_PARENT_RMEAN, _RE_PARENT_RSTD,
     _RE_PARENT_YOY_DIFF, _RE_PARENT_YOY_RAT,
-    _RE_SHARE_PARENT, _RE_SHARE_PAR_YOY,
+    _RE_SHARE_PARENT_LAG, _RE_SHARE_PARENT_YOY,
     _RE_LAG, _RE_ROLLING_MEAN, _RE_ROLLING_STD,
     _RE_YOY_DIFF, _RE_YOY_RAT, _RE_TREND, _RE_TREND_SLOPE,
     _RE_MOMENTUM, _RE_CV, _RE_ZERO_SHARE,
@@ -142,27 +163,178 @@ def _slope(vals, mc=3):
 
 def _is_rev(col):
     cl = col.lower()
-    blocked = ('gdp','cpi','france','china','japan','united','macro','pmi','confidence','ord','order','asp')
+    blocked = ('gdp','cpi','france','china','japan','united','macro','pmi','confidence','industrial','construction','ord','order','asp')
     return ('rev' in cl or 'revenue' in cl) and not any(t in cl for t in blocked)
 
 
-def recompute_lag_features(history, period, entity_key, feature_cols):
+def _parse_parent_key_from_col(col_name, row,
+                                bu_col=DEFAULT_BU_COL,
+                                seg_col=DEFAULT_SEG_COL):
+    """
+    Given a parent-feature column name, figure out which parent entity key
+    to look up in the history dict.
+
+    Parent column format examples:
+      Revenue cons. (anon)_Parent_Lag_1_TGL Business Unit
+      Revenue cons. (anon)_Parent_Lag_1_TGL Business Unit__TGL Business Segment
+
+    The suffix after the last numeric parameter encodes the parent level columns,
+    separated by '__' when more than one grouping column is involved.
+
+    Returns a tuple, e.g. (bu_value,) or (bu_value, seg_value).
+    """
+    # The parent-level identifier is the last capture group in _RE_PARENT_LAG etc.
+    # We look at the suffix of the column name after stripping the metric prefix +
+    # the per-feature operation chunk.  Rather than over-engineering this, we
+    # use a simple heuristic: if the column ends with seg_col, use (BU, Seg);
+    # if it ends with bu_col, use (BU,).
+    col_lower = col_name.lower()
+    bu_val   = row[bu_col]  if bu_col  in row.index else None
+    seg_val  = row[seg_col] if seg_col in row.index else None
+
+    seg_suffix = seg_col.lower().replace(' ', '')
+    bu_suffix  = bu_col.lower().replace(' ', '')
+
+    col_stripped = col_lower.replace(' ', '')
+
+    # Check most-specific first (Segment-level parent = BU + Segment)
+    if seg_suffix in col_stripped and bu_suffix in col_stripped:
+        return (bu_val, seg_val)
+    # BU-only parent
+    if bu_suffix in col_stripped:
+        return (bu_val,)
+    # Fallback — shouldn't happen with well-named features
+    return (bu_val,)
+
+
+def recompute_lag_features(history, period, entity_key, feature_cols,
+                           row=None,
+                           bu_col=DEFAULT_BU_COL,
+                           seg_col=DEFAULT_SEG_COL):
     """
     Dynamically updates lag and rolling features for a specific entity and date.
-    'entity_key' is a tuple (e.g., (BU, Segment)) identifying the series.
+    'entity_key' is a tuple identifying the child series.
+    'row' is the DataFrame row (needed to resolve parent-level keys).
+    'history' contains entries for BOTH child and parent levels:
+       child  key: (entity_key,  period)     e.g. ((BU, Seg, Sub), period)
+       BU     key: ((bu_val,),   period)
+       Segment key: ((bu_val, seg_val), period)
     """
     updates = {}
     for col in feature_cols:
-        if not _is_rev(col): continue  # Only process revenue-based lags
+        if not _is_rev(col): continue  # Only recompute revenue-based feature
 
-        # 1. Simple Lags (e.g., Rev_Lag_1)
+        # ── PARENT FEATURES (must be checked BEFORE child patterns) ──────────
+
+        # 1a. Parent Lag
+        m = _RE_PARENT_LAG.search(col)
+        if m:
+            lag_val = int(m.group(1))
+            if row is not None:
+                pk = _parse_parent_key_from_col(col, row, bu_col, seg_col)
+                parent_hist_key = (pk, period - lag_val)
+                parent_val = history.get(parent_hist_key, np.nan)
+                updates[col] = parent_val
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 1b. Parent Rolling Mean
+        m = _RE_PARENT_RMEAN.search(col)
+        if m:
+            window = int(m.group(1))
+            if row is not None:
+                pk = _parse_parent_key_from_col(col, row, bu_col, seg_col)
+                vals = [history.get((pk, period - x), np.nan) for x in range(1, window + 1)]
+                updates[col] = np.nanmean(vals) if any(~np.isnan(vals)) else np.nan
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 1c. Parent Rolling Std
+        m = _RE_PARENT_RSTD.search(col)
+        if m:
+            window = int(m.group(1))
+            if row is not None:
+                pk = _parse_parent_key_from_col(col, row, bu_col, seg_col)
+                vals = [history.get((pk, period - x), np.nan) for x in range(1, window + 1)]
+                updates[col] = np.nanstd(vals) if len([x for x in vals if not np.isnan(x)]) >= 2 else np.nan
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 1d. Parent YoY Diff
+        m = _RE_PARENT_YOY_DIFF.search(col)
+        if m:
+            if row is not None:
+                pk = _parse_parent_key_from_col(col, row, bu_col, seg_col)
+                v1  = history.get((pk, period - 1),  np.nan)
+                v13 = history.get((pk, period - 13), np.nan)
+                updates[col] = v1 - v13 if not (np.isnan(v1) or np.isnan(v13)) else np.nan
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 1e. Parent YoY Ratio
+        m = _RE_PARENT_YOY_RAT.search(col)
+        if m:
+            if row is not None:
+                pk = _parse_parent_key_from_col(col, row, bu_col, seg_col)
+                v1  = history.get((pk, period - 1),  np.nan)
+                v13 = history.get((pk, period - 13), np.nan)
+                if not (np.isnan(v1) or np.isnan(v13)) and abs(v13) > 1e-8:
+                    updates[col] = v1 / v13
+                else:
+                    updates[col] = np.nan
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 1f. Share-of-Parent Lag
+        m = _RE_SHARE_PARENT_LAG.search(col)
+        if m:
+            lag_val = int(m.group(1))
+            if row is not None:
+                pk = _parse_parent_key_from_col(col, row, bu_col, seg_col)
+                child_val  = history.get((entity_key, period - lag_val), np.nan)
+                parent_val = history.get((pk, period - lag_val), np.nan)
+                if not (np.isnan(child_val) or np.isnan(parent_val)) and abs(parent_val) > 1e-8:
+                    updates[col] = child_val / parent_val
+                else:
+                    updates[col] = np.nan
+            else:
+                updates[col] = np.nan
+            continue
+
+        # 1g. Share-of-Parent YoY Diff
+        m = _RE_SHARE_PARENT_YOY.search(col)
+        if m:
+            if row is not None:
+                pk = _parse_parent_key_from_col(col, row, bu_col, seg_col)
+                # share(t-1) - share(t-13)
+                def _share_at(offset):
+                    cv = history.get((entity_key, period - offset), np.nan)
+                    pv = history.get((pk, period - offset), np.nan)
+                    if not (np.isnan(cv) or np.isnan(pv)) and abs(pv) > 1e-8:
+                        return cv / pv
+                    return np.nan
+                s1  = _share_at(1)
+                s13 = _share_at(13)
+                updates[col] = s1 - s13 if not (np.isnan(s1) or np.isnan(s13)) else np.nan
+            else:
+                updates[col] = np.nan
+            continue
+
+        # ── CHILD / SELF FEATURES ─────────────────────────────────────────────
+
+        # 2. Simple Lags (e.g., Rev_Lag_1)
         m = _RE_LAG.search(col)
         if m:
             lag_val = int(m.group(1))
             updates[col] = history.get((entity_key, period - lag_val), np.nan)
             continue
 
-        # 2. Rolling Means (e.g., Rev_Rolling_Mean_3)
+        # 3. Rolling Means (e.g., Rev_Rolling_Mean_3)
         m = _RE_ROLLING_MEAN.search(col)
         if m:
             window = int(m.group(1))
@@ -170,7 +342,7 @@ def recompute_lag_features(history, period, entity_key, feature_cols):
             updates[col] = np.nanmean(vals) if any(~np.isnan(vals)) else np.nan
             continue
 
-        # 3. Rolling Standard Deviation
+        # 4. Rolling Standard Deviation
         m = _RE_ROLLING_STD.search(col)
         if m:
             window = int(m.group(1))
@@ -178,7 +350,7 @@ def recompute_lag_features(history, period, entity_key, feature_cols):
             updates[col] = np.nanstd(vals) if len([x for x in vals if not np.isnan(x)]) >= 2 else np.nan
             continue
 
-        # 4. Trend Slopes (Linear regression over window)
+        # 5. Trend Slopes (Linear regression over window)
         m = _RE_TREND.search(col) or _RE_TREND_SLOPE.search(col)
         if m:
             window = int(m.group(1))
@@ -189,8 +361,8 @@ def recompute_lag_features(history, period, entity_key, feature_cols):
             else:
                 updates[col] = np.nan
             continue
-            
-        # 5. YoY Difference
+
+        # 6. YoY Difference
         m = _RE_YOY_DIFF.search(col)
         if m:
             val_t1 = history.get((entity_key, period - 1), np.nan)
@@ -200,8 +372,8 @@ def recompute_lag_features(history, period, entity_key, feature_cols):
             else:
                 updates[col] = np.nan
             continue
-            
-        # 6. YoY Ratio
+
+        # 7. YoY Ratio
         m = _RE_YOY_RAT.search(col)
         if m:
             val_t1 = history.get((entity_key, period - 1), np.nan)
@@ -212,24 +384,22 @@ def recompute_lag_features(history, period, entity_key, feature_cols):
                 updates[col] = np.nan
             continue
 
-        # 7. Momentum
+        # 8. Momentum
         m = _RE_MOMENTUM.search(col)
         if m:
             short_w = int(m.group(1))
             long_w  = int(m.group(2))
             vals_s = [history.get((entity_key, period - x), np.nan) for x in range(1, short_w + 1)]
             s_mean = np.nanmean(vals_s) if any(~np.isnan(vals_s)) else np.nan
-            
             vals_l = [history.get((entity_key, period - x), np.nan) for x in range(1, long_w + 1)]
             l_mean = np.nanmean(vals_l) if any(~np.isnan(vals_l)) else np.nan
-            
             if not np.isnan(s_mean) and not np.isnan(l_mean):
                 updates[col] = s_mean - l_mean
             else:
                 updates[col] = np.nan
             continue
 
-        # 8. Coefficient of Variation (CV)
+        # 9. Coefficient of Variation (CV)
         m = _RE_CV.search(col)
         if m:
             w = int(m.group(1))
@@ -242,7 +412,7 @@ def recompute_lag_features(history, period, entity_key, feature_cols):
                 updates[col] = np.nan
             continue
 
-        # 9. Zero Share
+        # 10. Zero Share
         m = _RE_ZERO_SHARE.search(col)
         if m:
             w = int(m.group(1))
@@ -255,6 +425,7 @@ def recompute_lag_features(history, period, entity_key, feature_cols):
             continue
 
     return updates
+
 
 def diagnose_feature_coverage(feature_cols, subseg_col=DEFAULT_SUBSEG_COL,
                               seg_col=DEFAULT_SEG_COL, bu_col=DEFAULT_BU_COL):
@@ -293,63 +464,70 @@ def diagnose_feature_coverage(feature_cols, subseg_col=DEFAULT_SUBSEG_COL,
 
 # === MODEL DEFINITIONS ===
 def get_models(cat_cols, feature_cols):
-    cat_idx = [feature_cols.index(c) for c in cat_cols if c in feature_cols]
+    """
+    FIX: CatBoost no longer receives cat_features in its constructor.
+    It is passed dynamically in fit_model() via model.fit(..., cat_features=cat_idx).
+    This resolves the sklearn clone() error:
+      'Cannot clone CatBoostRegressor ... as the constructor either does not set
+       or modifies parameter cat_features'
+    """
     models = {
         'LightGBM': (lgb.LGBMRegressor(
-            n_estimators=300,        # era 500
+            n_estimators=300,
             learning_rate=0.05,
-            num_leaves=15,           # era 31 — menos folhas = menos complexidade
-            min_child_samples=30,    # era 20 — mais amostras por folha
-            subsample=0.7,           # era 0.8
-            colsample_bytree=0.7,    # era 0.8
-            reg_alpha=0.1,           # L1 — novo
-            reg_lambda=1.0,          # L2 — novo
+            num_leaves=15,
+            min_child_samples=30,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
             random_state=42, verbosity=-1, n_jobs=-1), False),
 
         'XGBoost': (xgb.XGBRegressor(
-            n_estimators=300,        # era 500
+            n_estimators=300,
             learning_rate=0.05,
-            max_depth=4,             # era 6
-            min_child_weight=5,      # novo — evita splits em poucos pontos
-            subsample=0.7,           # era 0.8
-            colsample_bytree=0.7,    # era 0.8
-            reg_alpha=0.1,           # L1 — novo
-            reg_lambda=1.0,          # L2 — novo
+            max_depth=4,
+            min_child_weight=5,
+            subsample=0.7,
+            colsample_bytree=0.7,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
             random_state=42, verbosity=0,
             enable_categorical=True, tree_method='hist'), False),
 
         'Ridge': (Ridge(
-            alpha=10.0,              # era 1.0 — mais regularização
+            alpha=10.0,
             random_state=42), True),
 
         'Lasso': (Lasso(
-            alpha=10.0,              # era 1.0
+            alpha=10.0,
             random_state=42, max_iter=5000), True),
 
         'ElasticNet': (ElasticNet(
-            alpha=10.0,              # era 1.0
+            alpha=10.0,
             l1_ratio=0.5,
             random_state=42, max_iter=5000), True),
 
         'Random Forest': (RandomForestRegressor(
-            n_estimators=200,        # era 300
-            max_depth=8,             # era 15 — muito profundo para poucos dados
-            min_samples_leaf=20,     # era 10
-            max_features=0.6,        # novo — subsample de features
+            n_estimators=200,
+            max_depth=8,
+            min_samples_leaf=20,
+            max_features=0.6,
             random_state=42, n_jobs=-1), True),
 
         'Gradient Boosting': (GradientBoostingRegressor(
-            n_estimators=200,        # era 300
+            n_estimators=200,
             learning_rate=0.05,
-            max_depth=3,             # era 5
-            min_samples_leaf=20,     # era 10
-            subsample=0.7,           # novo
+            max_depth=3,
+            min_samples_leaf=20,
+            subsample=0.7,
             random_state=42), True),
     }
     if _HAS_CATBOOST:
-        models['CatBoost'] = (CatBoostRegressor(iterations=500, learning_rate=0.05,
-            depth=6, random_seed=42, verbose=0,
-            cat_features=cat_idx if cat_idx else None), False)
+        # FIX: No cat_features in constructor — passed dynamically in fit_model()
+        models['CatBoost'] = (CatBoostRegressor(
+            iterations=500, learning_rate=0.05,
+            depth=6, random_seed=42, verbose=0), False)
     return models
 
 # === FIT / PREDICT PIPELINE ===
@@ -384,6 +562,11 @@ def fit_model(model, X_train, y_train, needs_preprocessing, cat_cols, feature_co
         fp = {}
         if isinstance(model, lgb.LGBMRegressor):
             fp['categorical_feature'] = [c for c in cat_cols if c in feature_cols]
+        # FIX: Pass cat_features dynamically for CatBoost
+        if _HAS_CATBOOST and isinstance(model, CatBoostRegressor):
+            cat_idx = [feature_cols.index(c) for c in cat_cols if c in feature_cols]
+            if cat_idx:
+                fp['cat_features'] = cat_idx
         model.fit(X_train, y_train, **fp)
     return model, preprocessors
 
@@ -398,45 +581,107 @@ def train_and_predict(model, X_train, y_train, X_val, needs_preprocessing, cat_c
     fitted, pp = fit_model(model, X_train, y_train, needs_preprocessing, cat_cols, feature_cols)
     return predict_with_model(fitted, X_val, needs_preprocessing, pp, cat_cols, feature_cols)
 
-# === RECURSIVE MULTI-STEP FORECASTING ===
-def _build_parent_history(train_df, period_col, subseg_col, bu_col, target):
+
+# === PARENT HISTORY HELPERS ===
+def _init_parent_history(train_df, period_col, bu_col, seg_col, target):
+    """
+    Build a history dict that contains entries for:
+      - BU level:      key = ((bu_val,), period)
+      - Segment level: key = ((bu_val, seg_val), period)
+    from the training data.
+    """
     ph = {}
-    for period in train_df[period_col].unique():
-        m = train_df[period_col] == period
-        for bu, total in train_df.loc[m].groupby(bu_col)[target].sum().items():
-            ph[(bu, period)] = total
+    for period, grp in train_df.groupby(period_col):
+        # BU aggregates
+        for bu_val, bu_grp in grp.groupby(bu_col):
+            ph[((bu_val,), period)] = bu_grp[target].sum()
+        # Segment aggregates (BU+Segment)
+        if seg_col in train_df.columns:
+            for (bu_val, seg_val), seg_grp in grp.groupby([bu_col, seg_col]):
+                ph[((bu_val, seg_val), period)] = seg_grp[target].sum()
     return ph
 
-def _update_parent_history(ph, history, df_slice, period, subseg_col, bu_col):
-    sums = {}
-    for _, row in df_slice.iterrows():
-        bu = row[bu_col]
-        pred = history.get((row[subseg_col], period), 0.0)
-        sums[bu] = sums.get(bu, 0.0) + pred
-    for bu, t in sums.items():
-        ph[(bu, period)] = t
+
+def _update_parent_history(history, val_df_slice, period,
+                            bu_col, seg_col, target):
+    """
+    After predicting a period, recompute BU and Segment aggregates from the
+    new values stored in history under the child entity keys.
+    val_df_slice is the rows of the validation DF for this period.
+    """
+    bu_sums  = {}
+    seg_sums = {}
+    for _, row in val_df_slice.iterrows():
+        bu_val = row[bu_col]
+        has_seg = seg_col in row.index and pd.notna(row.get(seg_col))
+        seg_val = row[seg_col] if has_seg else None
+
+        # Retrieve the prediction we just stored in history for this row's child key
+        # The child entity key is NOT stored in this helper — we re-derive from the
+        # passed-in history using a lookup by (bu, seg, subseg) or (bu, seg).
+        # Since _update_parent_history is called AFTER the child history is already
+        # updated, we sum everything in history at this period matching the parent.
+        bu_sums[bu_val] = bu_sums.get(bu_val, 0.0)  # We'll sum below
+        if has_seg:
+            seg_sums[(bu_val, seg_val)] = seg_sums.get((bu_val, seg_val), 0.0)
+
+    # Re-aggregate from whatever child-level keys are in history for this period
+    bu_totals  = {}
+    seg_totals = {}
+    for (ek, p), val in history.items():
+        if p != period: continue
+        if not isinstance(ek, tuple): continue
+        if len(ek) == 1:
+            continue  # This is already a BU entry — don't double-count
+        if len(ek) == 2:
+            continue  # This is already a Seg entry — don't double-count
+        # Child (subsegment) entry: len == 3 → (BU, Seg, Sub)
+        if len(ek) >= 2:
+            bu_val = ek[0]
+            bu_totals[bu_val] = bu_totals.get(bu_val, 0.0) + val
+            if len(ek) >= 3:
+                seg_val = ek[1]
+                seg_totals[(bu_val, seg_val)] = seg_totals.get((bu_val, seg_val), 0.0) + val
+
+    # Write back aggregates
+    for bu_val, total in bu_totals.items():
+        history[((bu_val,), period)] = total
+    for (bu_val, seg_val), total in seg_totals.items():
+        history[((bu_val, seg_val), period)] = total
 
 
+# === RECURSIVE MULTI-STEP FORECASTING ===
 def recursive_forecast(model, train_df, val_df, feature_cols, group_cols,
                        needs_preprocessing=False, preprocessors=None,
                        cat_cols=None, target=DEFAULT_TARGET, absolute_target=DEFAULT_TARGET,
-                       period_col=DEFAULT_PERIOD_COL, predicts_delta=False):
+                       period_col=DEFAULT_PERIOD_COL, predicts_delta=False,
+                       bu_col=DEFAULT_BU_COL, seg_col=DEFAULT_SEG_COL):
     """
     Performs step-by-step forecasting, updating lags with previous predictions.
+
+    FIX: Parent features are now properly maintained. At each step:
+      1. Child entity history is updated with the new prediction.
+      2. Parent-level aggregates (BU, BU+Segment) are recomputed from child history.
+      3. parent lag/rolling features look up the correct parent key.
+
     Works for any granularity level defined in 'group_cols'.
-    If predicts_delta=True, the model predicts the differenced target. It will 
-    automatically reconstruct the absolute target before updating history.
+    If predicts_delta=True, the model predicts the differenced target.
     """
     if cat_cols is None: cat_cols = []
 
-    # Helper to generate a unique key for an entity (supports multi-column keys)
     def get_entity_key(row):
         return tuple(row[c] for c in group_cols) if isinstance(group_cols, list) else row[group_cols]
 
-    # Initialize history with known training values (ALWAYS absolute)
+    # Initialize child-level history from training data (ALWAYS absolute)
     history = {}
     for _, row in train_df.iterrows():
         history[(get_entity_key(row), row[period_col])] = row[absolute_target]
+
+    # FIX: Initialize parent-level history from training data
+    parent_history_init = _init_parent_history(
+        train_df, period_col, bu_col, seg_col, absolute_target
+    )
+    history.update(parent_history_init)
 
     val = val_df.copy()
     all_preds_abs = np.zeros(len(val))
@@ -452,8 +697,13 @@ def recursive_forecast(model, train_df, val_df, feature_cols, group_cols,
 
         # A. Update features for the current time step using predicted history
         for i in indices:
-            entity = get_entity_key(val.loc[i])
-            updates = recompute_lag_features(history, period, entity, feature_cols)
+            row_i = val.loc[i]
+            entity = get_entity_key(row_i)
+            # FIX: pass row_i so parent keys can be resolved
+            updates = recompute_lag_features(
+                history, period, entity, feature_cols,
+                row=row_i, bu_col=bu_col, seg_col=seg_col
+            )
             for col_name, value in updates.items():
                 val.at[i, col_name] = value
 
@@ -470,14 +720,14 @@ def recursive_forecast(model, train_df, val_df, feature_cols, group_cols,
             for idx_orig, p_delta in zip(indices, preds):
                 entity = get_entity_key(val.loc[idx_orig])
                 prev_abs = history.get((entity, period - 1), np.nan)
-                if np.isnan(prev_abs): # Fallback
-                    prev_abs = 0.0 
+                if np.isnan(prev_abs):
+                    prev_abs = 0.0
                 abs_preds.append(prev_abs + p_delta)
-            preds = np.array(abs_preds)    
+            preds = np.array(abs_preds)
 
         preds = np.clip(preds, -clip_val, clip_val)
 
-        # D. Update global prediction array and history for next steps
+        # D. Update global prediction array and child history for next steps
         mask_idx_positions = np.where(mask.values)[0]
         for m_pos, p_val in zip(mask_idx_positions, preds):
             all_preds_abs[m_pos] = p_val
@@ -485,13 +735,20 @@ def recursive_forecast(model, train_df, val_df, feature_cols, group_cols,
         for idx_orig, p_val in zip(indices, preds):
             history[(get_entity_key(val.loc[idx_orig]), period)] = p_val
 
+        # FIX: Recompute parent-level aggregates after updating child history
+        _update_parent_history(
+            history, val.loc[mask], period, bu_col, seg_col, absolute_target
+        )
+
     return all_preds_abs
+
 
 # === BENCHMARKING ===
 def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
                             level_name, group_cols,
                             models=None, target=DEFAULT_TARGET, absolute_target=DEFAULT_TARGET,
-                            period_col=DEFAULT_PERIOD_COL, predicts_delta=False):
+                            period_col=DEFAULT_PERIOD_COL, predicts_delta=False,
+                            bu_col=DEFAULT_BU_COL, seg_col=DEFAULT_SEG_COL):
     """
     Clones, fits, and evaluates multiple models using the recursive engine.
 
@@ -499,8 +756,7 @@ def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
     -------
     results       : list[dict] — metrics per model (RMSE, MAE, wMAPE, R2, ...)
     all_forecasts : dict[str, dict] — per-model forecasts by entity key
-                    Structure: { model_name: { entity_key: np.array(H) } }
-                    entity_key matches group_cols (e.g. (bu, seg, sub) for Subsegment)
+    all_fitted    : dict[str, dict] — per-model in-sample fits by entity key
     """
     if models is None:
         models = get_models(cat_cols, feature_cols)
@@ -510,7 +766,6 @@ def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
     val_df   = train_full[train_full[period_col] > val_cutoff].copy()
     y_val    = val_df[absolute_target].values
 
-    # Pre-compute entity keys and val periods (needed to build forecast dicts)
     def get_entity_key(row):
         return tuple(row[c] for c in group_cols) if isinstance(group_cols, list) else row[group_cols]
 
@@ -519,8 +774,8 @@ def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
                     for i in val_df.index]
 
     results       = []
-    all_forecasts = {}   # { model_name: { entity_key: np.array(H) } }
-    all_fitted    = {}   # { model_name: { entity_key: np.array(T) } }
+    all_forecasts = {}
+    all_fitted    = {}
 
     for name, (template, needs_pp) in models.items():
         print(f'  {name} @ {level_name} ...', end=' ', flush=True)
@@ -537,15 +792,11 @@ def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
                          if needs_pp and pp else fitted.predict(X_tr))
             train_r2  = r2_score(y_tr, preds_tr)
 
-
-            # In-sample fitted values por série (para MinT mint_shrink)
+            # In-sample fitted values per series
             fitted_values = {}
-            if needs_pp and pp:
-                preds_tr_full = predict_with_model(fitted, X_tr, True, pp, cat_cols, feature_cols)
-            else:
-                preds_tr_full = fitted.predict(X_tr)
+            preds_tr_full = (predict_with_model(fitted, X_tr, True, pp, cat_cols, feature_cols)
+                             if needs_pp and pp else fitted.predict(X_tr))
 
-            # Map to entity_key → {period: fitted_value}
             for idx, pred_val in zip(train_df.index, preds_tr_full):
                 entity = get_entity_key(train_df.loc[idx])
                 period = train_df.loc[idx, period_col]
@@ -553,7 +804,6 @@ def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
                     fitted_values[entity] = {}
                 fitted_values[entity][period] = pred_val
 
-            # Map to entity_key → np.array(H) sorted by period
             fitted_values = {
                 ek: np.array([pdict[p] for p in sorted(pdict)])
                 for ek, pdict in fitted_values.items()
@@ -563,26 +813,25 @@ def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
             # ── Recursive forecast ─────────────────────────────────────────
             preds_flat = recursive_forecast(
                 fitted, train_df, val_df, feature_cols,
-                group_cols        = group_cols,
+                group_cols          = group_cols,
                 needs_preprocessing = needs_pp,
-                preprocessors     = pp,
-                cat_cols          = cat_cols,
-                target            = target,
-                absolute_target   = absolute_target,
-                period_col        = period_col,
-                predicts_delta    = predicts_delta
+                preprocessors       = pp,
+                cat_cols            = cat_cols,
+                target              = target,
+                absolute_target     = absolute_target,
+                period_col          = period_col,
+                predicts_delta      = predicts_delta,
+                bu_col              = bu_col,
+                seg_col             = seg_col,
             )
 
             # ── Build per-entity forecast dict ─────────────────────────────
-            # preds_flat is a flat array aligned with val_df rows.
-            # We reshape it into { entity_key: np.array(H) } for MinT.
             entity_forecasts = {}
             for (entity_key, period), pred_val in zip(entity_index, preds_flat):
                 if entity_key not in entity_forecasts:
                     entity_forecasts[entity_key] = {}
                 entity_forecasts[entity_key][period] = pred_val
 
-            # Convert inner dict {period: value} → np.array sorted by period
             entity_forecasts = {
                 ek: np.array([pdict[p] for p in sorted(pdict)])
                 for ek, pdict in entity_forecasts.items()
@@ -609,7 +858,7 @@ def run_recursive_benchmark(train_full, val_cutoff, feature_cols, cat_cols,
 def expanding_window_cv(df, feature_cols, cat_cols, model_template, needs_preproc, group_cols,
                         min_train_periods=30, horizon=6, target=DEFAULT_TARGET, absolute_target=DEFAULT_TARGET,
                         period_col=DEFAULT_PERIOD_COL, subseg_col=DEFAULT_SUBSEG_COL,
-                        bu_col=DEFAULT_BU_COL, predicts_delta=False):
+                        bu_col=DEFAULT_BU_COL, seg_col=DEFAULT_SEG_COL, predicts_delta=False):
     df = df.copy()
     max_p = df[period_col].max()
     for c in cat_cols:
@@ -624,42 +873,39 @@ def expanding_window_cv(df, feature_cols, cat_cols, model_template, needs_prepro
             mdl = clone(model_template)
             fitted, pp = fit_model(mdl, tf[feature_cols], tf[target].values,
                                    needs_preproc, cat_cols, feature_cols)
-            preds = recursive_forecast(fitted, tf, vf, feature_cols,
-                                       group_cols=group_cols,
-                                       needs_preprocessing=needs_preproc, preprocessors=pp,
-                                       cat_cols=cat_cols, target=target, absolute_target=absolute_target, period_col=period_col,
-                                       predicts_delta=predicts_delta)
+            preds = recursive_forecast(
+                fitted, tf, vf, feature_cols,
+                group_cols=group_cols,
+                needs_preprocessing=needs_preproc, preprocessors=pp,
+                cat_cols=cat_cols, target=target, absolute_target=absolute_target,
+                period_col=period_col, predicts_delta=predicts_delta,
+                bu_col=bu_col, seg_col=seg_col,
+            )
             m = compute_metrics(vf[absolute_target].values, preds, '', '')
             folds.append({'cutoff': cutoff, 'val_range': f'{vs}-{ve}',
                 'RMSE': m['RMSE'], 'MAE': m['MAE'], 'R2': m['R2'],
                 'n_train': len(tf), 'n_val': len(vf)})
-        except:
+        except Exception as e:
             print(f'Fold {cutoff} failed: {e}')
             folds.append({'cutoff': cutoff, 'val_range': f'{vs}-{ve}',
                 'RMSE': np.nan, 'MAE': np.nan, 'R2': np.nan,
                 'n_train': len(tf), 'n_val': len(vf)})
     return pd.DataFrame(folds)
 
+
 # === SEGMENT-LEVEL AGGREGATION ===
 def build_segment_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDERS_COL,
                              period_col=DEFAULT_PERIOD_COL, bu_col=DEFAULT_BU_COL,
                              seg_col=DEFAULT_SEG_COL):
-    """
-    Aggregates data at the Business Unit + Segment level and computes lag features.
-    """
-    # Aggregate to Segment Level
     agg = df.groupby([period_col, bu_col, seg_col]).agg(
         {target: 'sum', orders_col: 'sum'}).reset_index()
 
-    # Carry over macro features (GDP, Industrial, etc.)
     mcols = [c for c in df.columns if any(t in c for t in ['GDP', 'France', 'Month', 'Quarter', 'Industrial'])]
     if mcols:
         mdf = df.groupby(period_col)[mcols].first().reset_index()
         agg = agg.merge(mdf, on=period_col, how='left')
 
     agg = agg.sort_values([bu_col, seg_col, period_col]).reset_index(drop=True)
-
-    # Feature Engineering: Lags and Rolling Windows
     gk = [bu_col, seg_col]
     g = agg.groupby(gk)[target]
 
@@ -672,7 +918,6 @@ def build_segment_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDER
 
     agg['Rev_YoY_Diff'] = g.transform(lambda x: x.shift(1).diff(12))
 
-    # Trend Slopes
     for w in [3, 6]:
         agg[f'Rev_Trend_Slope_{w}'] = g.transform(
             lambda x: x.shift(1).rolling(w, min_periods=3).apply(
@@ -688,16 +933,13 @@ def build_segment_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDER
     print(f'Segment-level dataset: {agg.shape}')
     return agg
 
+
 # === BU-LEVEL DATA PREPARATION ===
 def build_bu_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDERS_COL,
                         period_col=DEFAULT_PERIOD_COL, bu_col=DEFAULT_BU_COL):
-    """
-    Aggregates data at the Business Unit level and computes lag features.
-    """
     agg = df.groupby([period_col, bu_col]).agg(
         {target: 'sum', orders_col: 'sum'}).reset_index()
 
-    # Carry over macro features
     mcols = [c for c in df.columns if any(t in c for t in [
         'GDP', 'France', 'Month', 'Quarter', 'Industrial',
         'China', 'Japan', 'United', 'CPI', 'PMI',
@@ -708,7 +950,6 @@ def build_bu_level_data(df, target=DEFAULT_TARGET, orders_col=DEFAULT_ORDERS_COL
         agg = agg.merge(mdf, on=period_col, how='left')
 
     agg = agg.sort_values([bu_col, period_col]).reset_index(drop=True)
-
     g = agg.groupby(bu_col)[target]
 
     for lag in [1, 3, 12]:
@@ -756,9 +997,6 @@ def prepare_bu_data(bu_df, val_cutoff, target=DEFAULT_TARGET,
 
 
 
-import matplotlib.pyplot as plt
-import seaborn as sns
-
 def plot_forecast_comparison(
     train_df,
     submission_df,
@@ -766,8 +1004,8 @@ def plot_forecast_comparison(
     target_col,
     best_model_name,
     output_dir,
-    forecast_col='Revenue_Predicted',
-    hist_periods_label='Historical Revenue (periods 1–42)',
+    forecast_col="Revenue cons. (anon)",
+    hist_periods_label="Historical Revenue (periods 1–42)",
     forecast_periods_label=None
 ):
     """
@@ -780,9 +1018,9 @@ def plot_forecast_comparison(
     submission_df : pd.DataFrame
         Dataset containing forecasted values.
     period_col : str
-        Name of the period column.
+        Name of the period column (must exist in both train_df and submission_df).
     target_col : str
-        Name of the historical target column.
+        Name of the historical target column in train_df.
     best_model_name : str
         Name of the model (used in title and filename).
     output_dir : Path
@@ -800,326 +1038,102 @@ def plot_forecast_comparison(
         forecast_periods_label = f"{best_model_name} Forecast (periods 43–48)"
 
     # Aggregate historical and forecast values by period
-    hist = train_df.groupby(period_col)[target_col].sum()
-    fore = submission_df.groupby(period_col)[forecast_col].sum()
+    hist = (
+        train_df.groupby(period_col)[target_col]
+        .sum()
+        .sort_index()
+    )
+    fore = (
+        submission_df.groupby(period_col)[forecast_col]
+        .sum()
+        .sort_index()
+    )
 
     # Create figure
     fig, ax = plt.subplots(figsize=(14, 5))
 
     # Historical area + line
-    ax.fill_between(hist.index, hist.values, alpha=0.75,
-                    color='#378ADD', label=hist_periods_label)
-    ax.plot(hist.index, hist.values, color='#185FA5', linewidth=0.8)
+    ax.fill_between(
+        hist.index, hist.values,
+        alpha=0.75, color="#378ADD",
+        label=hist_periods_label
+    )
+    ax.plot(hist.index, hist.values, color="#185FA5", linewidth=0.8)
 
     # Forecast area + line
-    ax.fill_between(fore.index, fore.values, alpha=0.80,
-                    color='#D85A30', label=forecast_periods_label)
-    ax.plot(fore.index, fore.values, color='#993C1D',
-            linewidth=2, marker='o', markersize=6, zorder=5)
+    ax.fill_between(
+        fore.index, fore.values,
+        alpha=0.80, color="#D85A30",
+        label=forecast_periods_label
+    )
+    ax.plot(
+        fore.index, fore.values,
+        color="#993C1D",
+        linewidth=2, marker="o", markersize=6, zorder=5
+    )
 
     # Annotate forecast values (in millions)
     for period, val in fore.items():
-        ax.annotate(f'{val/1e6:.0f}M', xy=(period, val), xytext=(0, 10),
-                    textcoords='offset points', ha='center',
-                    fontsize=8.5, color='#993C1D', fontweight='500')
+        ax.annotate(
+            f"{val/1e6:.0f}M",
+            xy=(period, val),
+            xytext=(0, 10),
+            textcoords="offset points",
+            ha="center",
+            fontsize=8.5,
+            color="#993C1D",
+            fontweight="500"
+        )
 
     # Vertical line separating historical vs forecast
-    ax.axvline(hist.index.max() + 0.5, color='#888780',
-               linewidth=1.5, linestyle='--', alpha=0.8)
-    ax.text(hist.index.max() + 0.7, ax.get_ylim()[1] * 0.97, 'forecast →',
-            fontsize=9, color='#888780', va='top')
+    ax.axvline(
+        hist.index.max() + 0.5,
+        color="#888780",
+        linewidth=1.5,
+        linestyle="--",
+        alpha=0.8
+    )
+    ax.text(
+        hist.index.max() + 0.7,
+        ax.get_ylim()[1] * 0.97,
+        "forecast →",
+        fontsize=9,
+        color="#888780",
+        va="top"
+    )
 
     # Format y-axis in millions
     ax.yaxis.set_major_formatter(
-        plt.FuncFormatter(lambda x, _: f'{x/1e6:.0f}M')
+        plt.FuncFormatter(lambda x, _: f"{x/1e6:.0f}M")
     )
 
     # Labels and title
-    ax.set_xlabel('Period', fontsize=11)
-    ax.set_ylabel('Total Revenue', fontsize=11)
+    ax.set_xlabel("Period", fontsize=11)
+    ax.set_ylabel("Total Revenue", fontsize=11)
     ax.set_title(
-        f'{best_model_name} — Historical Revenue & Forecast  '
-        f'(Subsegment level, all series aggregated)',
-        fontsize=12, pad=12
+        f"{best_model_name} — Historical Revenue & Forecast "
+        f"(Subsegment level, all series aggregated)",
+        fontsize=12,
+        pad=12
     )
 
     # Legend and layout
-    ax.legend(fontsize=10, loc='upper left')
-    ax.set_xlim(1, max(fore.index) + 1)
+    ax.legend(fontsize=10, loc="upper left")
+    ax.set_xlim(hist.index.min(), max(fore.index) + 1)
     sns.despine()
     plt.tight_layout()
 
-    # Save figure
-    output_path = output_dir / f'forecast_plot_{best_model_name.lower()}.png'
-    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    # Safer filename
+    safe_name = (
+        best_model_name.lower()
+        .replace(" ", "_")
+        .replace("/", "_")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+    output_path = output_dir / f"forecast_plot_{safe_name}.png"
+    plt.savefig(output_path, dpi=150, bbox_inches="tight")
     plt.show()
 
     return output_path
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MinT RECONCILIATION — Minimum Trace (Wickramasuriya et al. 2019)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def build_hierarchy_map(df, bu_col=DEFAULT_BU_COL, seg_col=DEFAULT_SEG_COL,
-                        subseg_col=DEFAULT_SUBSEG_COL):
-    """
-    Build the hierarchy mapping from the training data.
-
-    Returns
-    -------
-    hier : dict with keys:
-        'bottom_keys'  : list of (bu, seg, sub) — one per bottom-level series
-        'seg_keys'     : list of (bu, seg)      — one per segment series
-        'bu_keys'      : list of (bu,)          — one per BU series
-        'S'            : np.ndarray (n_all × n_bottom) summing matrix
-    """
-    triples = sorted(set(zip(df[bu_col], df[seg_col], df[subseg_col])))
-    seg_keys = sorted(set((bu, seg) for bu, seg, _ in triples))
-    bu_keys = sorted(set((bu,) for bu, _, _ in triples))
-
-    bottom_keys = triples
-    n_b = len(bottom_keys)
-    n_s = len(seg_keys)
-    n_u = len(bu_keys)
-    n_all = 1 + n_u + n_s + n_b  # Total + BU + Segment + Subsegment
-
-    # Summing matrix S: rows = all nodes, cols = bottom-level only
-    # Order: [Total, BU_0..BU_u, Seg_0..Seg_s, Bottom_0..Bottom_b]
-    S = np.zeros((n_all, n_b))
-
-    # Total row: sums all bottom
-    S[0, :] = 1.0
-
-    # BU rows
-    bu_idx = {k: i for i, k in enumerate(bu_keys)}
-    for j, (bu, seg, sub) in enumerate(bottom_keys):
-        S[1 + bu_idx[(bu,)], j] = 1.0
-
-    # Segment rows
-    seg_idx = {k: i for i, k in enumerate(seg_keys)}
-    for j, (bu, seg, sub) in enumerate(bottom_keys):
-        S[1 + n_u + seg_idx[(bu, seg)], j] = 1.0
-
-    # Bottom rows: identity
-    S[1 + n_u + n_s:, :] = np.eye(n_b)
-
-    return {
-        'bottom_keys': bottom_keys,
-        'seg_keys': seg_keys,
-        'bu_keys': bu_keys,
-        'S': S,
-        'n_total': 1, 'n_bu': n_u, 'n_seg': n_s, 'n_bottom': n_b,
-    }
-
-
-def _assemble_forecast_matrix(fc_sub, fc_seg, fc_bu, hier, horizon):
-    """
-    Stacks base forecasts from all levels into a (n_all × H) matrix.
-    """
-    n_all = hier['n_total'] + hier['n_bu'] + hier['n_seg'] + hier['n_bottom']
-    Y = np.zeros((n_all, horizon))
-
-    total = np.zeros(horizon)
-    for i, bk in enumerate(hier['bu_keys']):
-        vals = fc_bu.get(bk, np.zeros(horizon))
-        Y[1 + i, :] = vals
-        total += vals
-    Y[0, :] = total
-
-    n_u = hier['n_bu']
-    for i, sk in enumerate(hier['seg_keys']):
-        Y[1 + n_u + i, :] = fc_seg.get(sk, np.zeros(horizon))
-
-    n_s = hier['n_seg']
-    for i, bk in enumerate(hier['bottom_keys']):
-        Y[1 + n_u + n_s + i, :] = fc_sub.get(bk, np.zeros(horizon))
-
-    return Y
-
-
-def _compute_residual_covariance(fitted_sub, fitted_seg, fitted_bu,
-                                 actuals_sub, actuals_seg, actuals_bu,
-                                 hier, method='mint_shrink'):
-    """
-    Compute the W_h matrix (covariance of reconciliation errors).
-
-    method: 'ols' | 'wls_struct' | 'wls_var' | 'mint_shrink'
-    """
-    n_all = hier['n_total'] + hier['n_bu'] + hier['n_seg'] + hier['n_bottom']
-
-    if method == 'ols':
-        return np.eye(n_all)
-
-    if method == 'wls_struct':
-        S = hier['S']
-        diag_vals = S @ np.ones(hier['n_bottom'])
-        return np.diag(diag_vals)
-
-    # For wls_var and mint_shrink, compute residuals
-    def _get_residuals(fitted_dict, actuals_dict, keys):
-        res_list = []
-        for k in keys:
-            if k in fitted_dict and k in actuals_dict:
-                f = np.asarray(fitted_dict[k], dtype=float)
-                a = np.asarray(actuals_dict[k], dtype=float)
-                min_len = min(len(f), len(a))
-                res_list.append(a[:min_len] - f[:min_len])
-            else:
-                res_list.append(np.array([0.0]))
-        return res_list
-
-    bu_res = _get_residuals(fitted_bu, actuals_bu, hier['bu_keys'])
-    max_T = max(len(r) for r in bu_res) if bu_res else 1
-    total_res = np.zeros(max_T)
-    for r in bu_res:
-        total_res[:len(r)] += r
-
-    residual_matrix = [total_res]
-
-    for r in bu_res:
-        padded = np.zeros(max_T)
-        padded[:len(r)] = r
-        residual_matrix.append(padded)
-
-    seg_res = _get_residuals(fitted_seg, actuals_seg, hier['seg_keys'])
-    for r in seg_res:
-        padded = np.zeros(max_T)
-        padded[:len(r)] = r
-        residual_matrix.append(padded)
-
-    sub_res = _get_residuals(fitted_sub, actuals_sub, hier['bottom_keys'])
-    for r in sub_res:
-        padded = np.zeros(max_T)
-        padded[:len(r)] = r
-        residual_matrix.append(padded)
-
-    E = np.column_stack(residual_matrix)  # (T × n_all)
-
-    if method == 'wls_var':
-        variances = np.var(E, axis=0, ddof=1)
-        variances = np.maximum(variances, 1e-8)
-        return np.diag(variances)
-
-    # mint_shrink: Ledoit-Wolf shrinkage
-    T, n = E.shape
-    if T < 2:
-        return np.eye(n_all)
-
-    E_centered = E - E.mean(axis=0, keepdims=True)
-    S_hat = (E_centered.T @ E_centered) / (T - 1)
-    F = np.diag(np.diag(S_hat))
-
-    sum_var_sij = 0.0
-    sum_sij2 = 0.0
-    for i in range(n):
-        for j in range(i + 1, n):
-            s_ij = S_hat[i, j]
-            var_sij = np.mean((E_centered[:, i] * E_centered[:, j] - s_ij) ** 2) / T
-            sum_var_sij += var_sij
-            sum_sij2 += s_ij ** 2
-
-    if sum_sij2 > 0:
-        lam = min(max(sum_var_sij / sum_sij2, 0.0), 1.0)
-    else:
-        lam = 1.0
-
-    W = (1 - lam) * S_hat + lam * F
-
-    eigvals = np.linalg.eigvalsh(W)
-    if eigvals.min() < 1e-10:
-        W += np.eye(n) * (1e-8 - eigvals.min())
-
-    return W
-
-
-def mint_reconcile(fc_sub, fc_seg, fc_bu,
-                   fitted_sub, fitted_seg, fitted_bu,
-                   actuals_sub, actuals_seg, actuals_bu,
-                   hier, horizon=6, method='mint_shrink',
-                   non_negative=True):
-    """
-    Reconcile base forecasts using MinT (Minimum Trace).
-
-    Returns
-    -------
-    reconciled_sub, reconciled_seg, reconciled_bu, reconciled_total
-    """
-    S = hier['S']
-    n_all, n_b = S.shape
-
-    Y_hat = _assemble_forecast_matrix(fc_sub, fc_seg, fc_bu, hier, horizon)
-
-    W = _compute_residual_covariance(
-        fitted_sub, fitted_seg, fitted_bu,
-        actuals_sub, actuals_seg, actuals_bu,
-        hier, method=method
-    )
-
-    try:
-        W_inv = np.linalg.inv(W)
-    except np.linalg.LinAlgError:
-        print('  [MinT] W singular — falling back to pseudo-inverse')
-        W_inv = np.linalg.pinv(W)
-
-    StWinv = S.T @ W_inv
-    StWinvS = StWinv @ S
-
-    try:
-        StWinvS_inv = np.linalg.inv(StWinvS)
-    except np.linalg.LinAlgError:
-        StWinvS_inv = np.linalg.pinv(StWinvS)
-
-    P = StWinvS_inv @ StWinv
-    Y_tilde_bottom = P @ Y_hat
-
-    if non_negative:
-        Y_tilde_bottom = np.maximum(Y_tilde_bottom, 0.0)
-
-    Y_tilde = S @ Y_tilde_bottom
-
-    n_u = hier['n_bu']
-    n_s = hier['n_seg']
-
-    reconciled_total = Y_tilde[0, :]
-
-    reconciled_bu = {}
-    for i, bk in enumerate(hier['bu_keys']):
-        reconciled_bu[bk] = Y_tilde[1 + i, :]
-
-    reconciled_seg = {}
-    for i, sk in enumerate(hier['seg_keys']):
-        reconciled_seg[sk] = Y_tilde[1 + n_u + i, :]
-
-    reconciled_sub = {}
-    for i, bk in enumerate(hier['bottom_keys']):
-        reconciled_sub[bk] = Y_tilde[1 + n_u + n_s + i, :]
-
-    base_total = Y_hat[0, :]
-    pct_change = np.abs(reconciled_total - base_total) / (np.abs(base_total) + 1e-8) * 100
-    print(f'  [MinT] Avg change per period: {pct_change.mean():.1f}%')
-
-    return reconciled_sub, reconciled_seg, reconciled_bu, reconciled_total
-
-
-def build_actuals_dict(df, group_cols, target=DEFAULT_TARGET,
-                       period_col=DEFAULT_PERIOD_COL):
-    """
-    Build { entity_key: np.array(T) } of actual values from a DataFrame.
-    """
-    actuals = {}
-
-    def get_key(row):
-        return tuple(row[c] for c in group_cols) if isinstance(group_cols, list) else (row[group_cols],)
-
-    for _, row in df.iterrows():
-        k = get_key(row)
-        p = row[period_col]
-        if k not in actuals:
-            actuals[k] = {}
-        actuals[k][p] = row[target]
-
-    return {
-        ek: np.array([pdict[p] for p in sorted(pdict)])
-        for ek, pdict in actuals.items()
-    }
