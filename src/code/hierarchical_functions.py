@@ -3,10 +3,10 @@ hierarchical_functions.py - ML forecasting pipeline.
 """
 import pandas as pd
 import numpy as np
-from src.code.functions_models import compute_metrics, run_recursive_benchmark
-from hierarchicalforecast.core import HierarchicalReconciliation
+from hierarchicalforecast.reconciliation import HierarchicalReconciliation
 from hierarchicalforecast.methods import MinTrace
-from hierarchicalforecast.utils import aggregate
+from src.code.functions_models import compute_metrics, run_recursive_benchmark
+
 
 def prepare_mint_inputs(train_full, forecasts_sub, forecasts_seg, forecasts_bu,
                         fitted_sub, fitted_seg, fitted_bu,
