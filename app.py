@@ -133,14 +133,7 @@ with st.sidebar:
     st.divider()
 
     # Read from Streamlit secrets if available (Streamlit Cloud deploy)
-    _secret_key = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
-    api_key = st.text_input(
-        "Groq API Key",
-        value=_secret_key,
-        type="password",
-        placeholder="gsk_..." if not _secret_key else "●●● loaded from secrets",
-        help="Free at console.groq.com — no credit card needed"
-    )
+    api_key = st.secrets.get("GROQ_API_KEY", "") if hasattr(st, "secrets") else ""
 
     st.divider()
     st.markdown("**Hierarchy**")
@@ -285,7 +278,7 @@ if "pending_query" in st.session_state:
 # ── PROCESS QUERY ──────────────────────────────────────────────────────────
 if query:
     if not api_key:
-        st.warning("Please enter your Groq API key in the sidebar. Get one free at console.groq.com")
+        st.warning("Groq API key not configured. Add GROQ_API_KEY to Streamlit secrets.")
         st.stop()
 
     st.session_state.messages.append({"role": "user", "content": query})
