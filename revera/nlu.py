@@ -1,5 +1,25 @@
 import json
+import re
 from groq import Groq
+
+# Calendar month → period number (P.1=Apr/21 … P.48=Mar/25)
+_MONTH_TO_PERIOD = {
+    "apr/21":  1, "may/21":  2, "jun/21":  3, "jul/21":  4, "aug/21":  5, "sep/21":  6,
+    "oct/21":  7, "nov/21":  8, "dec/21":  9, "jan/22": 10, "feb/22": 11, "mar/22": 12,
+    "apr/22": 13, "may/22": 14, "jun/22": 15, "jul/22": 16, "aug/22": 17, "sep/22": 18,
+    "oct/22": 19, "nov/22": 20, "dec/22": 21, "jan/23": 22, "feb/23": 23, "mar/23": 24,
+    "apr/23": 25, "may/23": 26, "jun/23": 27, "jul/23": 28, "aug/23": 29, "sep/23": 30,
+    "oct/23": 31, "nov/23": 32, "dec/23": 33, "jan/24": 34, "feb/24": 35, "mar/24": 36,
+    "apr/24": 37, "may/24": 38, "jun/24": 39, "jul/24": 40, "aug/24": 41, "sep/24": 42,
+    "oct/24": 43, "nov/24": 44, "dec/24": 45, "jan/25": 46, "feb/25": 47, "mar/25": 48,
+}
+
+def _preprocess(question: str) -> str:
+    """Replace calendar month labels with P.XX so the LLM always gets numeric periods."""
+    q = question
+    for month, period in _MONTH_TO_PERIOD.items():
+        q = re.sub(re.escape(month), f"P.{period}", q, flags=re.IGNORECASE)
+    return q
 
 NLU_SYSTEM = """You are the NLU engine for Revera, a Revenue forecast agent for Siemens Advanta.
 Your ONLY job is to parse a user question and return a JSON object.
@@ -31,7 +51,7 @@ LEVEL CONTEXT: If the user uses pronouns or vague references ("the lowest one", 
 
 OUT-OF-DOMAIN: If the question has nothing to do with Revenue forecasts, business units, segments, periods, or model performance (e.g. weather, sports, general knowledge, coding), return intent=error with error_msg="I can only answer questions about Siemens Advanta Revenue forecasts. Try asking about BUs, segments, periods or model performance."
 
-INVALID PERIOD: If the user mentions a period number that is NOT in [37,38,39,40,41,42,43,44,45,46,47,48], return intent=error with error_msg="Period X is not available. Available periods are 37–42 (historical) and 43–48 (forecast)."
+INVALID PERIOD: If the user mentions a period number or calendar month that does NOT map to any period in [37–48], return intent=error with error_msg="That period is not available. Historical data covers Apr/24–Sep/24 and forecast covers Oct/24–Mar/25."
 
 SINGLE PERIOD: If the user asks about one specific period (e.g. "all BU in period 37", "segments in P.45", "revenue for period 43"), set periods=[idx] (single-element array) where idx is the 0-based index of that period. Do NOT set intent=period_diff for single-period queries.
 
@@ -110,7 +130,7 @@ def parse_intent(question: str, api_key: str, history_json: str = "[]") -> dict:
         if content:
             messages.append({"role": role, "content": content})
             
-    messages.append({"role": "user", "content": question})
+    messages.append({"role": "user", "content": _preprocess(question)})
     
     def _call(model):
         return client.chat.completions.create(
