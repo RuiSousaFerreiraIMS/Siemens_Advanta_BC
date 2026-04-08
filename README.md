@@ -116,10 +116,21 @@ Siemens_Advanta_BC/
 │   ├── io_utils.py                     # I/O and export utilities
 │   └── class_pipeline_functions.py     # Class-based pipeline (legacy)
 │
+├── revera/                             # AI forecast intelligence agent
+│   ├── app.py                          # Streamlit chat interface
+│   ├── builders.py                     # Intent handlers, charts, tables
+│   ├── data.py                         # Historical + forecast data (Apr/21–Mar/25)
+│   ├── nlu.py                          # Groq API / Llama 3.3 70B intent parsing
+│   ├── pdf_export.py                   # Executive PDF report generator
+│   ├── requirements.txt                # Python dependencies
+│   ├── revera_report.pdf               # Executive summary report
+│   └── README.md                       # Revera usage and stack
+│
 ├── MLProjectOld/                       # Previous iteration (archived)
 ├── requirements.txt
 ├── .gitignore
 └── README.md
+
 ```
 
 ## Data
