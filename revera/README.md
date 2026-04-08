@@ -3,7 +3,11 @@
 
 Natural-language chat interface for exploring hierarchical Revenue forecasts across **4 BUs, 24 segments and 134 subsegments** — 42 months of history (Apr/21–Sep/24) plus a 6-month FlowState-r1.1 forecast (Oct/24–Mar/25), Bottom-Up aggregated (R² 0.9871 · wMAPE 9.40%).
 
-> ⚠️ **If the app shows a "This app is sleeping" screen** — Streamlit Community Cloud automatically puts inactive apps to sleep. Just click **"Wake up"** and wait ~30 seconds.
+## Live App
+
+**[https://revera-werjwwlwytprqbskpvtehd.streamlit.app](https://revera-werjwwlwytprqbskpvtehd.streamlit.app)**
+
+> ⚠️ **If the app shows a "This app is sleeping" screen** — Streamlit Community Cloud automatically puts inactive apps to sleep after a period of inactivity. Just click **"Wake up"** and wait ~30 seconds for it to start.
 
 ---
 
